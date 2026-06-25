@@ -135,6 +135,7 @@ VECTORCALL VECMATH_FINLINE bool v_test_any_bit_set(vec4f a);
 //! component-wise check that ALL selected components set to true (0xFFFFFFFF), not to false (0). Result for values between is UB!
 VECTORCALL VECMATH_FINLINE bool v_check_xyzw_all_true(vec4f a);
 VECTORCALL VECMATH_FINLINE bool v_check_xyz_all_true(vec4f a);
+VECTORCALL VECMATH_FINLINE bool v_check_xz_all_true(vec4f a);
 VECTORCALL VECMATH_FINLINE bool v_check_xy_all_true(vec4f a);
 
 //! component-wise check that ANY of selected components set to true (0xFFFFFFFF), not to false (0). Result for values between is UB!
@@ -379,12 +380,29 @@ VECTORCALL VECMATH_FINLINE vec4i v_subi(vec4i a, vec4i b);
 //! (a * b), signed integers. result is only correctly defined if both operands and result is within [-1<<31, 1<<31) range
 VECTORCALL VECMATH_FINLINE vec4i v_muli(vec4i a, vec4i b);
 
-//! shift left (unsigned integer). bits is immediate value
+//! 8x16-bit packed integer addition
+VECTORCALL VECMATH_FINLINE vec4i v_addi16(vec4i a, vec4i b);
+//! 8x16-bit packed integer subtraction
+VECTORCALL VECMATH_FINLINE vec4i v_subi16(vec4i a, vec4i b);
+//! 8x16-bit packed signed multiply, returns low 16 bits of each product
+VECTORCALL VECMATH_FINLINE vec4i v_muli16(vec4i a, vec4i b);
+//! 8x16-bit packed signed multiply, returns high 16 bits of each product
+VECTORCALL VECMATH_FINLINE vec4i v_mulhi16(vec4i a, vec4i b);
+//! 8x16-bit multiply pairs and pairwise add: {a0*b0+a1*b1, a2*b2+a3*b3, ...} -> 4x int32
+VECTORCALL VECMATH_FINLINE vec4i v_madd_i16(vec4i a, vec4i b);
+//! broadcast int16 value to all 8 16-bit lanes within vec4i
+VECTORCALL VECMATH_FINLINE vec4i v_splatsi16(int v);
+
+//! shift left (unsigned integer, 32-bit lanes). bits is immediate value
 VECTORCALL VECMATH_FINLINE vec4i v_slli(vec4i v, int bits);
-//! shift right (unsigned integer). bits is immediate value
+//! shift right (unsigned integer, 32-bit lanes). bits is immediate value
 VECTORCALL VECMATH_FINLINE vec4i v_srli(vec4i v, int bits);
-//! shift right (signed integer). bits is immediate value
+//! shift right (signed integer, 32-bit lanes). bits is immediate value
 VECTORCALL VECMATH_FINLINE vec4i v_srai(vec4i v, int bits);
+//! shift left (unsigned integer, 64-bit lanes). bits is immediate value
+VECTORCALL VECMATH_FINLINE vec4i v_slli_64(vec4i v, int bits);
+//! shift right (unsigned integer, 64-bit lanes). bits is immediate value
+VECTORCALL VECMATH_FINLINE vec4i v_srli_64(vec4i v, int bits);
 //! shift left (unsigned integer). bits is variative value
 VECTORCALL VECMATH_FINLINE vec4i v_slli_n(vec4i v, int bits);
 //! shift right (unsigned integer). bits is variative value
@@ -493,6 +511,8 @@ VECTORCALL VECMATH_FINLINE vec4f v_perm_xyab(vec4f xyzw, vec4f abcd);
 VECTORCALL VECMATH_FINLINE vec4f v_perm_zwcd(vec4f xyzw, vec4f abcd);
 VECTORCALL VECMATH_FINLINE vec4f v_perm_xaxa(vec4f xyzw, vec4f abcd);
 VECTORCALL VECMATH_FINLINE vec4f v_perm_yybb(vec4f xyzw, vec4f abcd);
+VECTORCALL VECMATH_FINLINE vec4f v_perm_xxab(vec4f xyzw, vec4f abcd);
+VECTORCALL VECMATH_FINLINE vec4f v_perm_yzab(vec4f xyzw, vec4f abcd);
 VECTORCALL VECMATH_FINLINE vec4f v_perm_bbyx(vec4f xyzw, vec4f abcd);
 VECTORCALL VECMATH_FINLINE vec4f v_perm_ayzw(vec4f xyzw, vec4f abcd);
 VECTORCALL VECMATH_FINLINE vec4f v_perm_xbzw(vec4f xyzw, vec4f abcd);
@@ -513,6 +533,8 @@ VECTORCALL VECMATH_FINLINE vec4i v_permi_zzww(vec4i xyzw);
 VECTORCALL VECMATH_FINLINE vec4i v_permi_xxzz(vec4i xyzw);
 VECTORCALL VECMATH_FINLINE vec4i v_permi_yyww(vec4i xyzw);
 VECTORCALL VECMATH_FINLINE vec4i v_permi_wwyy(vec4i xyzw);
+VECTORCALL VECMATH_FINLINE vec4i v_permi_yzxw(vec4i xyzw);
+VECTORCALL VECMATH_FINLINE vec4i v_permi_yzxy(vec4i xyzw);
 
 #define v_perm_xyXY v_perm_xyab
 #define v_perm_zwZW v_perm_zwcd
@@ -539,6 +561,23 @@ VECTORCALL VECMATH_FINLINE vec4i v_packus(vec4i a);
 VECTORCALL VECMATH_FINLINE vec4i v_packus16(vec4i a, vec4i b);
 //! pack 16x 16-bit ints into 16x unsigned 8-bit ints
 VECTORCALL VECMATH_FINLINE vec4i v_packus16(vec4i a);
+
+//! interleave low 8 bytes from a,b: {a0,b0,a1,b1,...,a7,b7}
+VECTORCALL VECMATH_FINLINE vec4i v_interleave_lo_i8(vec4i a, vec4i b);
+//! interleave high 8 bytes from a,b: {a8,b8,a9,b9,...,a15,b15}
+VECTORCALL VECMATH_FINLINE vec4i v_interleave_hi_i8(vec4i a, vec4i b);
+//! interleave low 4 shorts from a,b: {a0,b0,a1,b1,a2,b2,a3,b3}
+VECTORCALL VECMATH_FINLINE vec4i v_interleave_lo_i16(vec4i a, vec4i b);
+//! interleave high 4 shorts from a,b: {a4,b4,a5,b5,a6,b6,a7,b7}
+VECTORCALL VECMATH_FINLINE vec4i v_interleave_hi_i16(vec4i a, vec4i b);
+//! interleave low 2 ints from a,b: {a0,b0,a1,b1}
+VECTORCALL VECMATH_FINLINE vec4i v_interleave_lo_i32(vec4i a, vec4i b);
+//! interleave high 2 ints from a,b: {a2,b2,a3,b3}
+VECTORCALL VECMATH_FINLINE vec4i v_interleave_hi_i32(vec4i a, vec4i b);
+//! interleave low int64 from a,b: {a0,b0}
+VECTORCALL VECMATH_FINLINE vec4i v_interleave_lo_i64(vec4i a, vec4i b);
+//! interleave high int64 from a,b: {a1,b1}
+VECTORCALL VECMATH_FINLINE vec4i v_interleave_hi_i64(vec4i a, vec4i b);
 
 
 //
@@ -869,6 +908,10 @@ VECTORCALL VECMATH_FINLINE void v_bbox3_init_empty(bbox3f &b);
 VECTORCALL VECMATH_FINLINE void v_bbox3_init_ident(bbox3f &b);
 //! init with point
 VECTORCALL VECMATH_FINLINE void v_bbox3_init(bbox3f &b, vec3f p);
+//! init with bb2 rotated/scaled by 3 column vectors (no translation)
+VECTORCALL VECMATH_FINLINE void v_bbox3_rotate_init(bbox3f &b, vec3f col0, vec3f col1, vec3f col2, bbox3f_cref bb2);
+//! init with bb2 transformed with 3x3 matrix m (rotation/scale only, no translation)
+VECTORCALL VECMATH_FINLINE void v_bbox3_init(bbox3f &b, mat33f_cref m, bbox3f bb2);
 //! init with bb2 transformed with 4x4 matrix m
 VECTORCALL VECMATH_FINLINE void v_bbox3_init(bbox3f &b, mat44f_cref m, bbox3f bb2);
 //! init with bsph
@@ -1280,10 +1323,7 @@ VECTORCALL VECMATH_FINLINE int v_extract_zi(vec4i v);
 VECTORCALL VECMATH_FINLINE int v_extract_wi(vec4i v);
 
 //! insert scalar to vector by index
-VECTORCALL VECMATH_FINLINE vec4f v_insert(float s, vec4f v, int i);
-
-//! promote put scalar to specified place in vector; other elements undefined
-VECTORCALL VECMATH_FINLINE vec4f v_promote(float s, int i);
+VECTORCALL VECMATH_FINLINE vec4f v_insert(vec4f v, float x, int idx);
 
 // sign extend
 VECTORCALL VECMATH_FINLINE vec4f is_neg_special(vec4f a);
