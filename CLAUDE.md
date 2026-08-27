@@ -1,12 +1,13 @@
 # vecmath - SIMD Math Library
 
 ## Overview
-Platform-abstracted SIMD vector math library. Wraps SSE2/SSSE3/SSE4.1 (x86) and NEON (ARM) behind a
+Platform-abstracted SIMD vector math library. Wraps SSE2/SSSE3/SSE4.1 (x86), NEON (ARM) and a
+scalar per-lane fallback for targets with no SIMD ISA behind a
 unified C API. Used pervasively throughout the Dagor Engine for all performance-critical math:
 transforms, physics, BVH traversal, culling, animation, etc.
 
 ## Key Types (dag_vecMathDecl.h)
-- `vec4f` / `vec3f` -- 128-bit float vector (__m128 on SSE, float32x4_t on NEON)
+- `vec4f` / `vec3f` -- 128-bit float vector (__m128 on SSE, float32x4_t on NEON, a 16-byte struct on scalar)
 - `vec4i` -- 128-bit integer vector (__m128i / int32x4_t)
 - `mat33f` -- 3x3 column-major matrix (3 x vec3f)
 - `mat44f` -- 4x4 column-major matrix (4 x vec4f)
@@ -24,6 +25,8 @@ transforms, physics, BVH traversal, culling, animation, etc.
 | `dag_vecMath_const.h` | Constants: V_C_HALF, V_C_ONE, V_C_PI, V_C_UNIT_1000, V_CI_MASK*, etc. |
 | `dag_vecMath_pc_sse.h` | SSE low-level implementation of basic functions |
 | `dag_vecMath_neon.h` | NEON (ARM) low-level implementation of basic functions |
+| `dag_vecMath_scalar.h` | Scalar per-lane implementation of basic functions (no-SIMD fallback, forceable with `_TARGET_SIMD_SCALAR=1`) |
+| `dag_vecMath_double.h` | `vec4d` double-precision math (SSE/AVX, NEON and scalar in one file); include via dag_vecMath.h |
 | `dag_vecMath_common.h` | Shared implementations (bbox, frustum, quat, matrix ops built on core intrinsics) without hw-specific intrinsics |
 | `dag_vecMath_trig.h` | Polynomial approximations for sin/cos/tan/atan/asin/acos |
 
