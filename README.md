@@ -1,7 +1,8 @@
 # vecmath
 
 A small, header-only SIMD vector math library with one portable API across x86
-(SSE2/SSSE3/SSE4.1) and ARM (NEON / AArch64). Write your math once; it compiles to
+(SSE2/SSSE3/SSE4.1), ARM (NEON / AArch64), and any other CPU through a scalar
+per-lane backend. Write your math once; it compiles to
 good vector code on desktop, consoles, and mobile.
 
 vecmath is the math core of the [Dagor Engine](https://github.com/GaijinEntertainment/DagorEngine)
@@ -19,13 +20,15 @@ standalone, dependency-free version of those headers.
   passed in registers. Almost everything is force-inlined, so unused results melt
   away and there is no wrapper-object cost.
 - **Batteries included.** Vectors, 3x3 / 4x3 / 4x4 matrices, quaternions, planes,
-  bounding boxes and spheres, frustum culling, ray/triangle intersection, and fast
-  trig/exp approximations.
+  bounding boxes and spheres, frustum culling, ray/triangle intersection, fast
+  trig/exp approximations, and a double-precision `vec4d` layer.
 
 ## Requirements
 
 - C++11 or later.
-- An x86 target with at least SSE2, or an AArch64 (ARMv8) target with NEON.
+- An x86 target with at least SSE2, or an AArch64 (ARMv8) target with NEON;
+  any other target (Cortex-M, RISC-V without V, ...) uses the scalar backend,
+  selected automatically or forced with `_TARGET_SIMD_SCALAR=1`.
 - MSVC, Clang, or GCC.
 
 The target ISA is auto-detected from the usual compiler macros (`__SSE4_1__`,

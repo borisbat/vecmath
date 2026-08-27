@@ -48,10 +48,13 @@ VECTORCALL VECMATH_FINLINE bool v_check_xy_all_false(vec4f a) { return v_extract
 VECTORCALL VECMATH_FINLINE bool v_check_xy_any_true(vec4f a) { return v_extract_xi64(v_cast_vec4i(a)) != 0; }
 
 #if _TARGET_SIMD_SSE
-VECTORCALL VECMATH_FINLINE bool v_check_xz_all_true(vec4f a) { return (v_signmask(a) & 0b101) == 0b101; }
+VECTORCALL VECMATH_FINLINE bool v_check_xz_all_true(vec4f a) { return (v_truemask(a) & 0b101) == 0b101; }
 #else
 VECTORCALL VECMATH_FINLINE bool v_check_xz_all_true(vec4f a) { return v_check_xyzw_all_true(v_perm_xxzz(a)); }
 #endif
+
+//! number of true (all-ones) lanes among x,y,z of a canonical mask, 0..3; the w lane is ignored
+VECTORCALL VECMATH_FINLINE int v_count_true_xyz(vec4f a) { return v_count_true(v_perm_xyzd(a, v_zero())); }
 
 VECTORCALL VECMATH_FINLINE vec4f v_bool_to_mask(bool bool_mask) { return v_cast_vec4f(v_splatsi(bool_mask ? -1 : 0)); }
 VECTORCALL VECMATH_FINLINE vec4f v_bool_to_msbit(bool param) { return v_cast_vec4f(v_splatsi((param ? 1 : 0) << 31)); }
@@ -106,23 +109,9 @@ VECTORCALL VECMATH_FINLINE vec4i v_clampi(vec4i t, vec4i min_val, vec4i max_val)
   return v_maxi(v_mini(t, max_val), min_val);
 }
 
-VECTORCALL VECMATH_FINLINE vec4f v_round(vec4f a)
-{
-  vec4f offset = v_btsel(V_C_HALF, a, V_CI_SIGN_MASK);
-  vec4f adjusted = v_add(a, offset);
-  return v_trunc(adjusted);
-}
-
-VECTORCALL VECMATH_FINLINE vec4i v_cvt_roundi(vec4f a)
-{
-  vec4f offset = v_btsel(V_C_HALF, a, V_CI_SIGN_MASK);
-  vec4f adjusted = v_add(a, offset);
-  return v_cvt_trunci(adjusted);
-}
-
 VECTORCALL VECMATH_FINLINE vec4f v_cmp_relative_equal(vec4f a, vec4f b, vec4f max_diff, vec4f max_rel_diff)
 {
-  vec4f diff = v_abs(v_sub(a, b));
+  vec4f diff = v_abs_diff(a, b);
   vec4f m = v_max(v_abs(a), v_abs(b));
   return v_cmp_le(diff, v_min(max_diff, v_mul(m, max_rel_diff)));
 }
@@ -313,14 +302,6 @@ VECTORCALL VECMATH_FINLINE vec4f v_norm2_safe(vec4f a, vec4f def)
   return v_sel(v_div(a, len), def, v_is_unsafe_positive_divisor(lenSq));
 }
 
-VECTORCALL VECMATH_FINLINE vec3f v_cross3(vec3f a, vec3f b)
-{
-  // (a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
-  vec3f yzxw = v_perm_yzxw(a);
-  vec3f bcad = v_perm_yzxw(b);
-  return v_perm_yzxy(v_nmsub(yzxw, b, v_mul(a, bcad)));
-}
-
 VECTORCALL VECMATH_FINLINE void v_mat44_make_persp_forward(mat44f &dest, float wk, float hk, float zn, float zf)
 {
   float q = zf/(zf-zn);
@@ -398,6 +379,21 @@ VECTORCALL VECMATH_FINLINE void v_mat43_transpose_to_mat44(mat44f &dest, mat43f 
   v_mat44_transpose(dest.col0, dest.col1, dest.col2, dest.col3);
 }
 
+NO_ASAN_INLINE void v_mat44_load_from_mat43_overread_unsafe(mat44f &dest, const mat43f &m43)
+{
+#if defined(DAGOR_TSAN_ENABLED) || defined(DAGOR_ASAN_ENABLED) || (_TARGET_SIMD_SSE && !_TARGET_PC_WIN)
+  // non-Windows SSE is the dedicated server (a dev build shipped to production) - never
+  // over-read there; sanitizers take the exact 48-byte transpose too
+  v_mat43_transpose_to_mat44(dest, m43);
+#else
+  // in memory the mat44 columns sit at stride 4 across the mat43f rows - exactly the ld4
+  // access pattern, so the load and the transpose fuse into one instruction on NEON. NEON
+  // (all targets) and the Windows x86-64 dev majority keep the over-read so those developers
+  // hit the same out-of-bounds a NEON build would, instead of it only surfacing to few NEON devs
+  v_ld_soa4((const float *)&m43, dest.col0, dest.col1, dest.col2, dest.col3);
+#endif
+}
+
 VECTORCALL VECMATH_FINLINE void v_mat44_transpose_to_mat43(mat43f &dest, mat44f src)
 {
   vec4f r3 = src.col3; // mat43f has no 4th row; the transposed row3 is discarded
@@ -450,7 +446,7 @@ VECTORCALL VECMATH_FINLINE vec4f v_remove_nan(vec4f a)
 VECTORCALL VECMATH_FINLINE vec4f v_is_nan(vec4f a)
 {
   volatile vec4f v = a;
-#if !defined(_MSC_VER) || defined(__clang__)
+#if (!defined(_MSC_VER) || defined(__clang__)) && !defined(_TARGET_SIMD_SCALAR)
   return v_cmp_neq(a, v);
 #else
   return v_cmp_neq(a, (vec4f &)v);
@@ -480,7 +476,7 @@ VECTORCALL VECMATH_FINLINE bool v_test_mat44_nan(mat44f m)
 {
   return v_test_xyzw_nan(v_add(v_add(m.col0, m.col1), v_add(m.col2, m.col3)));
 }
-VECTORCALL VECMATH_FINLINE bool v_test_xyz_abs_lt(vec3f a, vec3f limit) { return v_check_xyz_all_true(v_cmp_lt(v_abs(a), limit)); }
+VECTORCALL VECMATH_FINLINE bool v_test_xyz_abs_lt(vec3f a, vec3f limit) { return v_check_xyz_all_true(v_cmp_abs_gt(limit, a)); }
 
 VECTORCALL VECMATH_FINLINE void v_mat33_transpose(mat33f &dest, mat33f_cref src)
 {
@@ -498,7 +494,7 @@ VECTORCALL VECMATH_FINLINE void v_mat33_make_from_look(mat33f &dest, vec4f look_
 
 VECTORCALL VECMATH_INLINE  void v_view_matrix_from_tangentZ( vec3f &left, vec3f &up, vec4f vdir )
 {
-  up = v_sel(V_C_UNIT_0010, V_C_UNIT_1000, v_cmp_gt(v_abs(v_splat_z(vdir)), v_splats(0.999f)));
+  up = v_sel(V_C_UNIT_0010, V_C_UNIT_1000, v_cmp_abs_gt(v_splat_z(vdir), v_splats(0.999f)));
   left = v_norm3(v_cross3(up, vdir));
   up = v_cross3(vdir, left);
 }
@@ -743,6 +739,47 @@ VECTORCALL VECMATH_FINLINE void v_mat44_orthonormal_inverse43_to44(mat44f &dest,
   dest.col3 = v_perm_xyzd(v_neg(v_mat44_mul_vec3v(dest, m.col3)), V_C_UNIT_0001);
 }
 
+VECTORCALL VECMATH_FINLINE void v_mat43_make_from_43cu(mat43f &tmV, const float *const __restrict m43)
+{
+  v_ldu_soa3(m43, tmV.row0, tmV.row1, tmV.row2);
+}
+
+VECTORCALL VECMATH_FINLINE void v_mat_43ca_from_mat43(float * __restrict m43, mat43f_cref tm)
+{
+  v_st_soa3(m43, tm.row0, tm.row1, tm.row2);
+}
+
+VECTORCALL VECMATH_FINLINE void v_mat_43cu_from_mat43(float * __restrict m43, mat43f_cref tm)
+{
+  v_stu_soa3(m43, tm.row0, tm.row1, tm.row2);
+}
+
+VECTORCALL VECMATH_FINLINE void v_mat44_make_affine(mat44f &m)
+{
+  m.col0 = v_perm_xyzd(m.col0, v_zero());
+  m.col1 = v_perm_xyzd(m.col1, v_zero());
+  m.col2 = v_perm_xyzd(m.col2, v_zero());
+  m.col3 = v_perm_xyzd(m.col3, V_C_UNIT_0001);
+}
+
+// same, but all .w lanes are undefined
+VECTORCALL VECMATH_FINLINE void v_mat44_orthonormal_inverse_from_43cu_unsafe(mat44f &dest, const float *const __restrict m43)
+{
+  // the deinterleaved rows are the columns of the transposed rotation, with the source
+  // translation left in the .w lanes - exactly what -T33(m)*pos needs
+  v_ldu_soa3(m43, dest.col0, dest.col1, dest.col2);
+  vec4f t = v_mul(dest.col0, v_splat_w(dest.col0));
+  t = v_madd(dest.col1, v_splat_w(dest.col1), t);
+  t = v_madd(dest.col2, v_splat_w(dest.col2), t);
+  dest.col3 = v_neg(t);
+}
+
+VECTORCALL VECMATH_FINLINE void v_mat44_orthonormal_inverse_from_43cu(mat44f &dest, const float *const __restrict m43)
+{
+  v_mat44_orthonormal_inverse_from_43cu_unsafe(dest, m43);
+  v_mat44_make_affine(dest);
+}
+
 VECTORCALL VECMATH_FINLINE vec4f v_mat33_det(mat33f_cref m)
 {
   return v_dot3(m.col2, v_cross3(m.col0, m.col1));
@@ -951,27 +988,17 @@ VECTORCALL VECMATH_FINLINE void v_bbox3_init_ident(bbox3f &b)
 VECTORCALL VECMATH_FINLINE void v_bbox3_init(bbox3f &b, vec3f p) { b.bmin = b.bmax = p; }
 VECTORCALL VECMATH_FINLINE void v_bbox3_rotate_init(bbox3f &b, vec3f col0, vec3f col1, vec3f col2, bbox3f_cref b2)
 {
-  vec4f boxMulM_0_0 = v_mul(v_splat_x(b2.bmin), col0);
-  vec4f boxMulM_0_1 = v_mul(v_splat_x(b2.bmax), col0);
-  vec4f boxMulM_1_0 = v_mul(v_splat_y(b2.bmin), col1);
-  vec4f boxMulM_1_1 = v_mul(v_splat_y(b2.bmax), col1);
-  vec4f boxMulM_2_0 = v_mul(v_splat_z(b2.bmin), col2);
-  vec4f boxMulM_2_1 = v_mul(v_splat_z(b2.bmax), col2);
-
-  vec4f boxSum_0_0 = v_add(boxMulM_1_0, boxMulM_2_0);
-  vec4f boxSum_0_1 = v_add(boxMulM_1_0, boxMulM_2_1);
-  vec4f boxSum_1_0 = v_add(boxMulM_1_1, boxMulM_2_0);
-  vec4f boxSum_1_1 = v_add(boxMulM_1_1, boxMulM_2_1);
-#define COMBINE_BOX(a,b,c) v_add(boxMulM_0_##a, boxSum_##b##_##c)
-  v_bbox3_init(  b, COMBINE_BOX(0, 0, 0));
-  v_bbox3_add_pt(b, COMBINE_BOX(0, 0, 1));
-  v_bbox3_add_pt(b, COMBINE_BOX(0, 1, 0));
-  v_bbox3_add_pt(b, COMBINE_BOX(0, 1, 1));
-  v_bbox3_add_pt(b, COMBINE_BOX(1, 0, 0));
-  v_bbox3_add_pt(b, COMBINE_BOX(1, 0, 1));
-  v_bbox3_add_pt(b, COMBINE_BOX(1, 1, 0));
-  v_bbox3_add_pt(b, COMBINE_BOX(1, 1, 1));
-#undef COMBINE_BOX
+  // AABB of the rotated box: transformed center +/- |M| * half-extent (Ericson RTCD 4.2.6).
+  vec4f center = v_bbox3_center(b2);
+  vec4f extent = v_mul(v_bbox3_size(b2), V_C_HALF);
+  vec4f c = v_mul(col0, v_splat_x(center));
+  c = v_madd(col1, v_splat_y(center), c);
+  c = v_madd(col2, v_splat_z(center), c);
+  vec4f e = v_mul(v_abs(col0), v_splat_x(extent));
+  e = v_madd(v_abs(col1), v_splat_y(extent), e);
+  e = v_madd(v_abs(col2), v_splat_z(extent), e);
+  b.bmin = v_sub(c, e);
+  b.bmax = v_add(c, e);
 }
 
 VECTORCALL VECMATH_FINLINE void v_bbox3_init(bbox3f &b, mat33f_cref m, bbox3f b2)
@@ -1173,25 +1200,25 @@ VECTORCALL inline bool v_bbox3_test_trasformed_box_likely_intersect(const bbox3f
   // so dist/ra use the two nonzero rows and rb sums hafB[k]*|L.b_k| over the 3 columns.
   vec3f tx = v_splat_x(t), ty = v_splat_y(t), tz = v_splat_z(t);
   // i = x: L = (0, -b_j.z, b_j.y)
-  vec3f dist0 = v_abs(v_sub(v_mul(rowY, tz), v_mul(rowZ, ty)));
+  vec3f dist0 = v_abs_diff(v_mul(rowY, tz), v_mul(rowZ, ty));
   vec3f ra0 = v_madd(absRowZ, aHafAy, v_mul(absRowY, aHafAz));
-  vec3f rb0 = v_madd(v_abs(v_sub(v_mul(rowY, v_splat_x(rowZ)), v_mul(rowZ, v_splat_x(rowY)))), aHafBx,
-              v_madd(v_abs(v_sub(v_mul(rowY, v_splat_y(rowZ)), v_mul(rowZ, v_splat_y(rowY)))), aHafBy,
-                 v_mul(v_abs(v_sub(v_mul(rowY, v_splat_z(rowZ)), v_mul(rowZ, v_splat_z(rowY)))), aHafBz)));
+  vec3f rb0 = v_madd(v_abs_diff(v_mul(rowY, v_splat_x(rowZ)), v_mul(rowZ, v_splat_x(rowY))), aHafBx,
+              v_madd(v_abs_diff(v_mul(rowY, v_splat_y(rowZ)), v_mul(rowZ, v_splat_y(rowY))), aHafBy,
+                 v_mul(v_abs_diff(v_mul(rowY, v_splat_z(rowZ)), v_mul(rowZ, v_splat_z(rowY))), aHafBz)));
   sep = v_or(sep, v_obb_sat_group_separated(dist0, ra0, rb0));
   // i = y: L = (b_j.z, 0, -b_j.x)
-  vec3f dist1 = v_abs(v_sub(v_mul(rowZ, tx), v_mul(rowX, tz)));
+  vec3f dist1 = v_abs_diff(v_mul(rowZ, tx), v_mul(rowX, tz));
   vec3f ra1 = v_madd(absRowZ, aHafAx, v_mul(absRowX, aHafAz));
-  vec3f rb1 = v_madd(v_abs(v_sub(v_mul(rowZ, v_splat_x(rowX)), v_mul(rowX, v_splat_x(rowZ)))), aHafBx,
-              v_madd(v_abs(v_sub(v_mul(rowZ, v_splat_y(rowX)), v_mul(rowX, v_splat_y(rowZ)))), aHafBy,
-                 v_mul(v_abs(v_sub(v_mul(rowZ, v_splat_z(rowX)), v_mul(rowX, v_splat_z(rowZ)))), aHafBz)));
+  vec3f rb1 = v_madd(v_abs_diff(v_mul(rowZ, v_splat_x(rowX)), v_mul(rowX, v_splat_x(rowZ))), aHafBx,
+              v_madd(v_abs_diff(v_mul(rowZ, v_splat_y(rowX)), v_mul(rowX, v_splat_y(rowZ))), aHafBy,
+                 v_mul(v_abs_diff(v_mul(rowZ, v_splat_z(rowX)), v_mul(rowX, v_splat_z(rowZ))), aHafBz)));
   sep = v_or(sep, v_obb_sat_group_separated(dist1, ra1, rb1));
   // i = z: L = (-b_j.y, b_j.x, 0)
-  vec3f dist2 = v_abs(v_sub(v_mul(rowX, ty), v_mul(rowY, tx)));
+  vec3f dist2 = v_abs_diff(v_mul(rowX, ty), v_mul(rowY, tx));
   vec3f ra2 = v_madd(absRowY, aHafAx, v_mul(absRowX, aHafAy));
-  vec3f rb2 = v_madd(v_abs(v_sub(v_mul(rowX, v_splat_x(rowY)), v_mul(rowY, v_splat_x(rowX)))), aHafBx,
-              v_madd(v_abs(v_sub(v_mul(rowX, v_splat_y(rowY)), v_mul(rowY, v_splat_y(rowX)))), aHafBy,
-                 v_mul(v_abs(v_sub(v_mul(rowX, v_splat_z(rowY)), v_mul(rowY, v_splat_z(rowX)))), aHafBz)));
+  vec3f rb2 = v_madd(v_abs_diff(v_mul(rowX, v_splat_x(rowY)), v_mul(rowY, v_splat_x(rowX))), aHafBx,
+              v_madd(v_abs_diff(v_mul(rowX, v_splat_y(rowY)), v_mul(rowY, v_splat_y(rowX))), aHafBy,
+                 v_mul(v_abs_diff(v_mul(rowX, v_splat_z(rowY)), v_mul(rowY, v_splat_z(rowX))), aHafBz)));
   sep = v_or(sep, v_obb_sat_group_separated(dist2, ra2, rb2));
 
   return v_check_xyz_all_false(sep); // intersecting iff no axis separated
@@ -1322,8 +1349,8 @@ VECMATH_FINLINE bool v_bsph_test_sph_inside(vec4f sph_a, vec4f sph_a_rad_sq_x, v
 
 VECMATH_FINLINE bool v_bsph_test_box_inside(vec4f sph, vec4f sph_rad_sq_x, bbox3f b)
 {
-  vec4f d1 = v_abs(v_sub(sph, b.bmin));
-  vec4f d2 = v_abs(v_sub(sph, b.bmax));
+  vec4f d1 = v_abs_diff(sph, b.bmin);
+  vec4f d2 = v_abs_diff(sph, b.bmax);
   vec4f r = v_length3_sq_x(v_max(d1, d2));
   return v_test_vec_x_lt(r, sph_rad_sq_x);
 }
@@ -1394,8 +1421,8 @@ VECMATH_FINLINE vec4f v_bsph_bsph_best_sum_unsafe(vec4f a, vec4f b)
 
 VECMATH_FINLINE vec4f v_bsph_bbox_best_sum_unsafe(vec4f bsph, bbox3f bbox)
 {
-  vec3f mind = v_abs(v_sub(bbox.bmin, bsph));
-  vec3f maxd = v_abs(v_sub(bbox.bmax, bsph));
+  vec3f mind = v_abs_diff(bbox.bmin, bsph);
+  vec3f maxd = v_abs_diff(bbox.bmax, bsph);
   vec3f p = v_sel(bbox.bmax, bbox.bmin, v_cmp_ge(mind, maxd));
   return v_bsph_pt_best_sum_unsafe(bsph, p);
 }
@@ -1441,8 +1468,8 @@ VECMATH_FINLINE void v_bsph_add_bsph_unsafe(vec4f& a, vec4f b)
 
 VECMATH_FINLINE void v_bsph_add_bbox_unsafe(vec4f& sph, bbox3f b)
 {
-  vec4f d1 = v_abs(v_sub(sph, b.bmin));
-  vec4f d2 = v_abs(v_sub(sph, b.bmax));
+  vec4f d1 = v_abs_diff(sph, b.bmin);
+  vec4f d2 = v_abs_diff(sph, b.bmax);
   vec4f r = v_length3(v_max(d1, d2));
   sph = v_perm_xyzd(sph, v_max(sph, r));
 }
@@ -1461,7 +1488,9 @@ VECTORCALL VECMATH_FINLINE vec3f v_quat_mul_vec3(quat4f q, vec3f v)
   return v_add(v, v_madd(v_splat_w(q), t, v_cross3(q, t)));//v + q.w * t + v_cross3(q.xyz, t);
 }
 
-VECTORCALL VECMATH_FINLINE quat4f v_quat_from_mat(vec3f col0, vec3f col1, vec3f col2)
+// fast path: columns MUST be orthonormal (scale-free). Result is a normalized rotation.
+// For scaled/unnormalized input use v_quat_from_mat*, which removes scale first.
+VECTORCALL VECMATH_FINLINE quat4f v_quat_from_orthonormal_mat(vec3f col0, vec3f col1, vec3f col2)
 {
   /* compute quaternion for each case */
   vec4f _yz_ = v_perm_xycd(col1, col2);
@@ -1492,36 +1521,72 @@ VECTORCALL VECMATH_FINLINE quat4f v_quat_from_mat(vec3f col0, vec3f col1, vec3f 
 
   vec4f q = v_sel(res0, res1, v_cmp_gt(yy, xx));
   q = v_sel(q, res2, v_and(v_cmp_gt(zz, xx), v_cmp_gt(zz, yy)));
-  return v_norm4(v_sel(q, res3, v_cmp_ge(v_splat_x(diagSum), v_zero())));
+  // no final normalize: 0.5*rsqrt(radicand) already yields a unit quaternion for orthonormal
+  // input (unit to 4e-7, rotation error 1.6e-6)
+  return v_sel(q, res3, v_cmp_ge(v_splat_x(diagSum), v_zero()));
 }
 
+VECTORCALL VECMATH_FINLINE quat4f v_quat_from_orthonormal_mat33(mat33f_cref m)
+{
+  return v_quat_from_orthonormal_mat(m.col0, m.col1, m.col2);
+}
+VECTORCALL VECMATH_FINLINE quat4f v_quat_from_orthonormal_mat43(mat44f_cref m)
+{
+  return v_quat_from_orthonormal_mat(m.col0, m.col1, m.col2);
+}
+
+// robust path: accepts any non-degenerate matrix. Removes per-column scale (one packed rsqrt via
+// v_mat33_remove_scale), flips col2 on a mirrored basis (det < 0, which a quat cannot represent -
+// same convention v_mat33_decompose uses, folding negative det into scale.z), and normalizes the
+// result, since scale removal does not fix sheared (non-orthogonal) columns.
+// Prefer v_quat_from_orthonormal_mat* for known pure rotations - it skips all three extra steps.
 VECTORCALL VECMATH_FINLINE quat4f v_quat_from_mat33(mat33f_cref m)
 {
-  return v_quat_from_mat(m.col0, m.col1, m.col2);
+  mat33f n;
+  v_mat33_remove_scale(n, m);
+  vec4f mirrored = v_cmp_lt(v_mat33_det(m), v_zero());
+  n.col2 = v_sel(n.col2, v_neg(n.col2), mirrored);
+  return v_norm4(v_quat_from_orthonormal_mat(n.col0, n.col1, n.col2));
+}
+VECTORCALL VECMATH_FINLINE quat4f v_quat_from_mat(vec3f col0, vec3f col1, vec3f col2)
+{
+  mat33f m;
+  m.col0 = col0;
+  m.col1 = col1;
+  m.col2 = col2;
+  return v_quat_from_mat33(m);
 }
 VECTORCALL VECMATH_FINLINE quat4f v_quat_from_mat43(mat44f_cref m)
 {
   return v_quat_from_mat(m.col0, m.col1, m.col2);
 }
 
+// 180 deg rotation taking a unit v0 to -v0 (opposite-vectors fallback of the arc quaternions);
+// result has w == 0 exactly. The axis is perpendicular to v0 to within |v0.x|, which is bounded
+// by the unsafe-divisor threshold below - a negligible (~1e-19) angular error.
+VECTORCALL VECMATH_FINLINE quat4f v_quat_180_from_unit(vec3f v0)
+{
+  // (v0.y, -v0.x, 0, 0) is exactly perpendicular to v0; its length x^2+y^2 stays >= the
+  // safe-under-squaring threshold unless |v0.x| is tiny, where the exactly-unit X axis (1,0,0,0)
+  // is used - perpendicular to within |v0.x|. The threshold keeps the length safe under FTZ.
+  vec4f perpXY = v_perm_xyab(v_perm_yaxx(v0, v_neg(v0)), v_zero());
+  return v_norm4(v_sel(perpXY, V_C_UNIT_1000, v_is_unsafe_divisor(v_splat_x(v0))));
+}
+
 //! make quaternion to rotate 'v0' to 'v1'; v0 and v1 must be normalized
 VECTORCALL VECMATH_FINLINE quat4f v_quat_from_unit_arc(vec3f v0, vec3f v1)
 {
   vec4f cosAngle = v_dot3(v0, v1);
-  vec4f cosAngleX2Plus2 = v_madd_x(cosAngle, V_C_TWO, V_C_TWO);
-  if (v_extract_x(cosAngleX2Plus2) > 1e-4)
+  vec4f cosAngleX2Plus2 = v_madd_x(cosAngle, V_C_TWO, V_C_TWO); // 2(1+cos) = |(cross, 1+cos)|^2
+  if (v_extract_x(cosAngleX2Plus2) > 1e-4f)
   {
-    vec3f crossVec = v_cross3(v0, v1);
-    vec4f recipCosHalfAngleX2 = v_rsqrt_x(cosAngleX2Plus2);
-    vec4f cosHalfAngleX2 = v_mul_x(recipCosHalfAngleX2, cosAngleX2Plus2);
-    return v_perm_xyzd(
-      v_mul(crossVec, v_splat_x(recipCosHalfAngleX2)),
-      v_splat_x(v_mul_x(cosHalfAngleX2, V_C_HALF)));
+    // q = (cross, 1+cos) normalized by its length sqrt(k)
+    vec4f len = v_splat_x(v_sqrt_x(cosAngleX2Plus2));
+    vec4f onePlusCos = v_splat_x(v_mul_x(cosAngleX2Plus2, V_C_HALF)); // splat so perm_xyzd sees it in .w
+    quat4f q = v_perm_xyzd(v_cross3(v0, v1), onePlusCos);
+    return v_div(q, len);
   }
-  // slow path for opposite vectors
-  if (v_test_vec_x_eq_0(v0))
-    return v_norm4(v_perm_xzbx(v_mul(v0, V_C_UNIT_0010), v_neg(v0)));
-  return v_norm4(v_perm_yaxx(v_mul(v0, V_C_UNIT_0100), v_neg(v0)));
+  return v_quat_180_from_unit(v0); // opposite vectors
 }
 
 //! make quaternion to rotate 'v0' to 'v1'
@@ -1529,20 +1594,17 @@ VECTORCALL VECMATH_FINLINE quat4f v_quat_from_arc(vec3f v0, vec3f v1)
 {
   vec4f inv_len_product = v_rsqrt_x(v_mul_x(v_length3_sq_x(v0), v_length3_sq_x(v1)));
   vec4f cosAngle = v_mul_x(v_dot3(v0, v1), inv_len_product);
-  vec4f cosAngleX2Plus2 = v_madd_x(cosAngle, V_C_TWO, V_C_TWO);
-  if (v_extract_x(cosAngleX2Plus2) > 1e-4)
+  vec4f cosAngleX2Plus2 = v_madd_x(cosAngle, V_C_TWO, V_C_TWO); // 2(1+cos)
+  if (v_extract_x(cosAngleX2Plus2) > 1e-4f)
   {
-    vec3f crossVec = v_cross3(v0, v1);
-    vec4f recipCosHalfAngleX2 = v_rsqrt_x(cosAngleX2Plus2);
-    vec4f cosHalfAngleX2 = v_mul_x(recipCosHalfAngleX2, cosAngleX2Plus2);
-    return v_perm_xyzd(
-      v_mul(crossVec, v_splat_x(v_mul_x(recipCosHalfAngleX2, inv_len_product))),
-      v_splat_x(v_mul_x(cosHalfAngleX2, V_C_HALF)));
+    // cross has magnitude len0*len1*sin, so scale it to unit by inv_len_product before normalizing
+    vec3f crossVec = v_mul(v_cross3(v0, v1), v_splat_x(inv_len_product));
+    vec4f len = v_splat_x(v_sqrt_x(cosAngleX2Plus2));
+    vec4f onePlusCos = v_splat_x(v_mul_x(cosAngleX2Plus2, V_C_HALF)); // splat so perm_xyzd sees it in .w
+    quat4f q = v_perm_xyzd(crossVec, onePlusCos);
+    return v_div(q, len);
   }
-  // slow path for opposite vectors
-  if (v_test_vec_x_eq_0(v0))
-    return v_norm4(v_perm_xzbx(v_mul(v0, V_C_UNIT_0010), v_neg(v0)));
-  return v_norm4(v_perm_yaxx(v_mul(v0, V_C_UNIT_0100), v_neg(v0)));
+  return v_quat_180_from_unit(v_norm3(v0)); // opposite vectors; normalize so the X-axis fallback is valid
 }
 
 //! make quaternion to rotate 'ang' radians around 'v' vector; v must be normalized
@@ -1611,11 +1673,12 @@ VECTORCALL inline quat4f v_quat_slerp(vec4f t, quat4f a, quat4f b)
   }
   b = v_xor(b, v_and(f, v_msbit()));
   vec4f w = v_acos(absF);
-  vec4f invsinw = v_rsqrt(v_sub(V_C_ONE, v_sqr(f)));
-  vec4f s = v_sin(v_mul(w, v_perm_xyab(v_sub(V_C_ONE, t), t)));
+  // pack (1-t, t, 1, 1) so one sin yields both numerators and sin(w); computing sin(w) from the
+  // same polynomial as the numerators cancels error in the ratio
+  vec4f s = v_sin(v_mul(w, v_perm_xyab(v_merge_hw(v_sub(V_C_ONE, t), t), V_C_ONE)));
   vec4f l = v_mul(a, v_splat_x(s));
-  vec4f r = v_mul(b, v_splat_z(s));
-  return v_mul(v_add(l, r), invsinw);
+  vec4f r = v_mul(b, v_splat_y(s));
+  return v_div(v_add(l, r), v_splat_z(s));
 }
 
 VECTORCALL VECMATH_FINLINE quat4f v_quat_qslerp(float t, quat4f l, quat4f r)
@@ -1668,7 +1731,7 @@ VECTORCALL VECMATH_FINLINE void v_quat_decompose_swing_twist(quat4f q, vec3f dir
 {
   // http://www.euclideanspace.com/maths/geometry/rotations/for/decomposition/
   vec3f p = v_mul(v_dot3(q, dir), dir);
-  twist = v_norm4_safe(v_perm_xyzW(p, q), V_C_UNIT_0001);
+  twist = v_norm4_safe(v_perm_xyzd(p, q), V_C_UNIT_0001);
   swing = v_quat_mul_quat(q, v_quat_conjugate(twist));
 }
 
@@ -1678,7 +1741,7 @@ VECTORCALL VECMATH_FINLINE void v_quat_decompose_swing_twist(quat4f q, vec3f dir
 VECTORCALL VECMATH_FINLINE void v_quat_decompose_twist_swing(quat4f q, vec3f dir, quat4f& twist, quat4f& swing)
 {
   vec3f p = v_mul(v_dot3(q, dir), dir);
-  twist = v_norm4_safe(v_perm_xyzW(p, q), V_C_UNIT_0001);
+  twist = v_norm4_safe(v_perm_xyzd(p, q), V_C_UNIT_0001);
   swing = v_quat_mul_quat(v_quat_conjugate(twist), q);
 }
 
@@ -1777,33 +1840,24 @@ VECTORCALL VECMATH_FINLINE void v_mat44_compose(mat44f &dest, vec4f pos, quat4f 
 //! decompose 3x3 matrix to rotation/scale
 VECTORCALL VECMATH_FINLINE void v_mat33_decompose(mat33f_cref tm, quat4f &rot, vec4f &scl)
 {
-  scl = v_mat44_scale43_sq(mat44f{tm.col0, tm.col1, tm.col2});
-  scl = v_sqrt(scl);
+  mat44f m{tm.col0, tm.col1, tm.col2};
+  scl = v_sqrt(v_mat44_scale43_sq(m));
   if (v_test_vec_x_lt_0(v_mat33_det(tm)))
     scl = v_perm_xycw(scl, v_neg(scl));
 
-  vec3f invScl = v_rcp_safe(scl);
-  rot = v_quat_from_mat(
-    v_mul(tm.col0, v_splat_x(invScl)),
-    v_mul(tm.col1, v_splat_y(invScl)),
-    v_mul(tm.col2, v_splat_z(invScl)));
+  // divide scale out; the basis can still be sheared or degenerate, which the
+  // orthonormal path does not tolerate, so keep the contract that rot is unit
+  v_mat44_apply_scale33(m, v_rcp_safe(scl));
+  rot = v_norm4(v_quat_from_orthonormal_mat43(m));
 }
 
 //! decompose 4x4 matrix to position/rotation/scale
 VECTORCALL VECMATH_FINLINE void v_mat4_decompose(mat44f_cref tm, vec3f &pos, quat4f &rot, vec4f &scl)
 {
   pos = tm.col3;
-
-  scl = v_mat44_scale43_sq(tm);
-  scl = v_sqrt(scl);
-  if (v_test_vec_x_lt_0(v_mat44_det43(tm)))
-    scl = v_perm_xycw(scl, v_neg(scl));
-
-  vec3f invScl = v_rcp_safe(scl);
-  rot = v_quat_from_mat(
-    v_mul(tm.col0, v_splat_x(invScl)),
-    v_mul(tm.col1, v_splat_y(invScl)),
-    v_mul(tm.col2, v_splat_z(invScl)));
+  mat33f m3;
+  v_mat33_from_mat44(m3, tm);
+  v_mat33_decompose(m3, rot, scl);
 }
 
 //! make rotational matrix 3x3 to rotate 'ang' radians around 'v'
@@ -1933,7 +1987,7 @@ VECTORCALL VECMATH_FINLINE vec3f v_unsafe_ray_intersect_plane(vec3f point, vec3f
   return v_madd(t, dir, point);
 }
 
-VECTORCALL VECMATH_FINLINE vec3f closest_point_on_segment(vec3f point, vec3f a, vec3f b)
+VECTORCALL VECMATH_FINLINE vec3f v_closest_point_on_segment(vec3f point, vec3f a, vec3f b)
 {
   vec3f ap = v_sub(point, a);
   vec3f ab = v_sub(b, a);
@@ -1942,7 +1996,7 @@ VECTORCALL VECMATH_FINLINE vec3f closest_point_on_segment(vec3f point, vec3f a, 
   return v_madd(v_safediv(ab, lenSq), t, a);
 }
 
-VECTORCALL VECMATH_FINLINE void vis_transform_points_4(vec4f* dest, vec4f x, vec4f y, vec4f z, mat44f_cref mat)
+VECTORCALL VECMATH_FINLINE void v_is_transform_points_4(vec4f* dest, vec4f x, vec4f y, vec4f z, mat44f_cref mat)
 {
 #define COMP(c, attr) \
   vec4f res_ ## c = v_splat_##attr(mat.col3); \
@@ -1957,7 +2011,7 @@ VECTORCALL VECMATH_FINLINE void vis_transform_points_4(vec4f* dest, vec4f x, vec
 #undef COMP
 }
 
-VECTORCALL VECMATH_FINLINE void vis_transform_points_4(vec4f* dest, vec4f x, vec4f y, mat44f_cref mat)
+VECTORCALL VECMATH_FINLINE void v_is_transform_points_4(vec4f* dest, vec4f x, vec4f y, mat44f_cref mat)
 {
 #define COMP(c, attr) \
   vec4f res_ ## c = v_splat_##attr(mat.col3); \
@@ -1971,20 +2025,78 @@ VECTORCALL VECMATH_FINLINE void vis_transform_points_4(vec4f* dest, vec4f x, vec
 #undef COMP
 }
 
-#if _TARGET_SIMD_SSE
-VECTORCALL VECMATH_FINLINE int v_test_vec_mask_eq_0(vec4f v) { return (~unsigned(-_mm_movemask_ps(v))) >> 31; }
-VECTORCALL VECMATH_FINLINE int v_test_vec_mask_neq_0(vec4f v) { return (unsigned(-_mm_movemask_ps(v))) >> 31; }
-#else
-VECTORCALL VECMATH_FINLINE int v_test_vec_mask_eq_0(vec4f v)
+// shared core of the v_is_visible* / v_screen_size_b family
+
+// transform the 8 aabb corners to clip space as two z-slices, each SoA: [xxxx],[yyyy],[zzzz],[wwww]
+// one clip-matrix row applied to 4 xy points at two z levels; the z slices share x and y,
+// so the x/y part is built once and each z is added on top
+VECTORCALL VECMATH_FINLINE void v_is_transform_row_2z(vec4f x, vec4f y, vec4f minz, vec4f maxz,
+  vec4f row_x, vec4f row_y, vec4f row_z, vec4f row_w, vec4f &out0, vec4f &out1)
 {
-  return v_test_vec_x_eqi_0(v_cast_vec4f(v_srli(v_cast_vec4i(v_hor(v)), 31)));
+  vec4f base = v_madd(x, row_x, row_w);
+  base = v_madd(y, row_y, base);
+  out0 = v_madd(minz, row_z, base);
+  out1 = v_madd(maxz, row_z, base);
 }
 
-VECTORCALL VECMATH_FINLINE int v_test_vec_mask_neq_0(vec4f v)
+VECTORCALL VECMATH_FINLINE void v_is_transform_box_8(vec3f bmin, vec3f bmax, mat44f_cref clip,
+  vec4f cs0[4], vec4f cs1[4], vec4f &cs0_negw, vec4f &cs1_negw)
 {
-  return !v_test_vec_mask_eq_0(v);
+  vec4f minmax_x = v_perm_xaxa(bmin, bmax);
+  vec4f minmax_y = v_perm_yybb(bmin, bmax);
+  vec4f minz = v_splat_z(bmin);
+  vec4f maxz = v_splat_z(bmax);
+  v_is_transform_row_2z(minmax_x, minmax_y, minz, maxz,
+    v_splat_x(clip.col0), v_splat_x(clip.col1), v_splat_x(clip.col2), v_splat_x(clip.col3), cs0[0], cs1[0]);
+  v_is_transform_row_2z(minmax_x, minmax_y, minz, maxz,
+    v_splat_y(clip.col0), v_splat_y(clip.col1), v_splat_y(clip.col2), v_splat_y(clip.col3), cs0[1], cs1[1]);
+  v_is_transform_row_2z(minmax_x, minmax_y, minz, maxz,
+    v_splat_z(clip.col0), v_splat_z(clip.col1), v_splat_z(clip.col2), v_splat_z(clip.col3), cs0[2], cs1[2]);
+  v_is_transform_row_2z(minmax_x, minmax_y, minz, maxz,
+    v_splat_w(clip.col0), v_splat_w(clip.col1), v_splat_w(clip.col2), v_splat_w(clip.col3), cs0[3], cs1[3]);
+  cs0_negw = v_neg(cs0[3]);
+  cs1_negw = v_neg(cs1[3]);
 }
-#endif
+
+// mask of the 8 points (two slices) on the inner side of one clip plane, i.e. coord > bound
+VECTORCALL VECMATH_FINLINE vec4f v_is_plane_inside_mask(vec4f coord0, vec4f bound0, vec4f coord1, vec4f bound1)
+{
+  return v_or(v_cmp_gt(coord0, bound0), v_cmp_gt(coord1, bound1));
+}
+
+// -1 if some point is on the inner side of every clip plane (x,y in [-w,w], z in [0,w]), 0 otherwise
+VECTORCALL VECMATH_FINLINE int v_is_frustum_nout_8(const vec4f cs0[4], vec4f cs0_negw, const vec4f cs1[4], vec4f cs1_negw)
+{
+  vec4f inXlo = v_is_plane_inside_mask(cs0[0], cs0_negw, cs1[0], cs1_negw);  // -w <= x
+  vec4f inXhi = v_is_plane_inside_mask(cs0[3], cs0[0],   cs1[3], cs1[0]);    //  x <= w
+  vec4f inYlo = v_is_plane_inside_mask(cs0[1], cs0_negw, cs1[1], cs1_negw);  // -w <= y
+  vec4f inYhi = v_is_plane_inside_mask(cs0[3], cs0[1],   cs1[3], cs1[1]);    //  y <= w
+  vec4f inZlo = v_is_plane_inside_mask(cs0[2], v_zero(), cs1[2], v_zero());  //  0 <= z
+  vec4f inZhi = v_is_plane_inside_mask(cs0[3], cs0[2],   cs1[3], cs1[2]);    //  z <= w
+  return v_is_merge_planes_nout(inXlo, inXhi, inYlo, inYhi, inZlo, inZhi);
+}
+
+// project 4 clip-space points to NDC and reduce to per-lane xy min/max (result still holds 2 points)
+VECTORCALL VECMATH_FINLINE void v_is_screen_project_minmax(const vec4f cs[4], vec4f &minXY, vec4f &maxXY)
+{
+  vec4f inv = v_rcp(cs[3]);
+  vec4f xxxx = v_mul(cs[0], inv);
+  vec4f yyyy = v_mul(cs[1], inv);
+  vec4f point01 = v_merge_hw(xxxx, yyyy);//xy, xy
+  vec4f point23 = v_merge_lw(xxxx, yyyy);//xy, xy
+  minXY = v_min(point01, point23);
+  maxXY = v_max(point01, point23);
+}
+
+// reduce xy min/max to screen_box (minX, maxX, minY, maxY); 0 if smaller than threshold in x or y, else 1
+VECTORCALL VECMATH_FINLINE int v_is_screen_finish(vec4f minXY, vec4f maxXY, vec3f threshold, vec4f &screen_box)
+{
+  minXY = v_min(minXY, v_rot_2(minXY));
+  maxXY = v_max(maxXY, v_rot_2(maxXY));
+  screen_box = v_merge_hw(minXY, maxXY);
+  vec4f tooSmall = v_cmp_ge(threshold, v_sub(maxXY, minXY));
+  return v_check_xy_any_true(tooSmall) ? 0 : 1;
+}
 
 //universal visibility function (accepts worldviewproj matrix)
 
@@ -1992,93 +2104,20 @@ VECTORCALL VECMATH_FINLINE int v_test_vec_mask_neq_0(vec4f v)
 ///really fast, ~0.075 us per test on PS3
 
 ///for branching: (~v_test_vec_x_eqi_0(v_is_visible(bmin, bmax, clip)))&1 will be 1 if visible, zero otherwise;
-VECTORCALL VECMATH_FINLINE vec4f v_is_visible(vec3f bmin, vec3f bmax, mat44f_cref clip)
+VECTORCALL VECMATH_INLINE vec4f v_is_visible(vec3f bmin, vec3f bmax, mat44f_cref clip)
 {
-  vec4f zero = v_zero();
-
-  // get aabb points (SoA)
-  vec4f minmax_x = v_perm_xXxX(bmin, bmax);
-  vec4f minmax_y = v_perm_yyYY(bmin, bmax);
-  vec4f minmax_z_0 = v_splat_z(bmin);
-  vec4f minmax_z_1 = v_splat_z(bmax);
-
-  // transform points to clip space
-  vec4f points_cs_0[4];
-  vec4f points_cs_1[4];
-
-  vis_transform_points_4(points_cs_0, minmax_x, minmax_y, minmax_z_0, clip);
-  vis_transform_points_4(points_cs_1, minmax_x, minmax_y, minmax_z_1, clip);
-
-  // calculate -w
-  vec4f points_cs_0_negw = v_neg(points_cs_0[3]);
-  vec4f points_cs_1_negw = v_neg(points_cs_1[3]);
-
-  // for each plane...
-  #define NOUT(a, b, c, d) v_hor(v_or(v_cmp_gt(a, b), v_cmp_gt(c, d)))
-
-  vec4f nout0 = NOUT(points_cs_0[0], points_cs_0_negw, points_cs_1[0], points_cs_1_negw);
-  vec4f nout1 = NOUT(points_cs_0[3], points_cs_0[0], points_cs_1[3], points_cs_1[0]);
-  vec4f nout2 = NOUT(points_cs_0[1], points_cs_0_negw, points_cs_1[1], points_cs_1_negw);
-  vec4f nout3 = NOUT(points_cs_0[3], points_cs_0[1], points_cs_1[3], points_cs_1[1]);
-  vec4f nout4 = NOUT(points_cs_0[2], zero, points_cs_1[2], zero);
-  vec4f nout5 = NOUT(points_cs_0[3], points_cs_0[2], points_cs_1[3], points_cs_1[2]);
-
-  #undef NOUT
-
-  // merge "not outside" flags
-  vec4f nout01 = v_and(nout0, nout1);
-  vec4f nout012 = v_and(nout01, nout2);
-
-  vec4f nout34 = v_and(nout3, nout4);
-  vec4f nout345 = v_and(nout34, nout5);
-
-  vec4f nout = v_and(nout012, nout345);
-
-  return nout;
+  vec4f cs0[4], cs1[4], cs0_negw, cs1_negw;
+  v_is_transform_box_8(bmin, bmax, clip, cs0, cs1, cs0_negw, cs1_negw);
+  // reduce each plane to a bit and broadcast the 0/-1 result once
+  return v_cast_vec4f(v_splatsi(v_is_frustum_nout_8(cs0, cs0_negw, cs1, cs1_negw)));
 }
 
-#if _TARGET_SIMD_SSE
-VECTORCALL VECMATH_FINLINE int v_is_visible_b(vec3f bmin, vec3f bmax, mat44f_cref clip)
+VECTORCALL VECMATH_INLINE int v_is_visible_b(vec3f bmin, vec3f bmax, mat44f_cref clip)
 {
-  // get aabb points (SoA)
-  vec4f minmax_x = v_perm_xXxX(bmin, bmax);
-  vec4f minmax_y = v_perm_yyYY(bmin, bmax);
-  vec4f minmax_z_0 = v_splat_z(bmin);
-  vec4f minmax_z_1 = v_splat_z(bmax);
-
-  // transform points to clip space
-  vec4f points_cs_0[4];
-  vec4f points_cs_1[4];
-
-  vis_transform_points_4(points_cs_0, minmax_x, minmax_y, minmax_z_0, clip);
-  vis_transform_points_4(points_cs_1, minmax_x, minmax_y, minmax_z_1, clip);
-
-  // calculate -w
-  vec4f points_cs_0_negw = v_neg(points_cs_0[3]);
-  vec4f points_cs_1_negw = v_neg(points_cs_1[3]);
-
-  // for each plane...
-  #define NOUT(a, b, c, d) (unsigned(-_mm_movemask_ps(v_or(v_cmp_gt(a, b), v_cmp_gt(c, d)))))
-  unsigned nout;
-  nout = (NOUT(points_cs_0[0], points_cs_0_negw, points_cs_1[0], points_cs_1_negw));
-  nout &= (NOUT(points_cs_0[3], points_cs_0[0], points_cs_1[3], points_cs_1[0]));
-  nout &= (NOUT(points_cs_0[1], points_cs_0_negw, points_cs_1[1], points_cs_1_negw));
-  nout &= (NOUT(points_cs_0[3], points_cs_0[1], points_cs_1[3], points_cs_1[1]));
-  nout &= (NOUT(points_cs_0[2], v_zero(), points_cs_1[2], v_zero()));
-  nout &= (NOUT(points_cs_0[3], points_cs_0[2], points_cs_1[3], points_cs_1[2]));
-
-  #undef NOUT
-
-  // merge "not outside" flags
-  return nout>>31;
+  vec4f cs0[4], cs1[4], cs0_negw, cs1_negw;
+  v_is_transform_box_8(bmin, bmax, clip, cs0, cs1, cs0_negw, cs1_negw);
+  return -v_is_frustum_nout_8(cs0, cs0_negw, cs1, cs1_negw); // 0 or 1
 }
-#else
-VECTORCALL VECMATH_FINLINE int v_is_visible_b(vec3f bmin, vec3f bmax, mat44f_cref clip)
-{
-  vec4f ret = v_is_visible(bmin, bmax, clip);
-  return (~v_test_vec_x_eqi_0(ret))&1;
-}
-#endif
 
 VECTORCALL VECMATH_FINLINE void v_construct_camplanes(mat44f_cref clip,
   vec4f &camPlanes0, vec4f &camPlanes1, vec4f &camPlanes2, vec4f &camPlanes3, vec4f &camPlanes4, vec4f &camPlanes5)
@@ -2093,19 +2132,55 @@ VECTORCALL VECMATH_FINLINE void v_construct_camplanes(mat44f_cref clip,
   camPlanes5 = m2.col2;  // near if forward depth (far otherwise)
 }
 
+// solve 4 three-plane intersections at once: lane i is the corner of planes (a_i, b_i, c);
+// p = -(a.w*(b x c) + b.w*(c x a) + c.w*(a x b)) / (a . (b x c)), a x b passed in (shared by batches)
+VECTORCALL VECMATH_FINLINE void v_frustum_corners_4(vec4f ax, vec4f ay, vec4f az, vec4f aw,
+  vec4f bx, vec4f by, vec4f bz, vec4f bw, vec4f abx, vec4f aby, vec4f abz, vec4f c,
+  vec4f &px, vec4f &py, vec4f &pz)
+{
+  vec4f cx = v_splat_x(c), cy = v_splat_y(c), cz = v_splat_z(c), cw = v_splat_w(c);
+  vec4f bcx = v_nmsub(bz, cy, v_mul(by, cz)); // b x c
+  vec4f bcy = v_nmsub(bx, cz, v_mul(bz, cx));
+  vec4f bcz = v_nmsub(by, cx, v_mul(bx, cy));
+  vec4f cax = v_nmsub(cz, ay, v_mul(cy, az)); // c x a
+  vec4f cay = v_nmsub(cx, az, v_mul(cz, ax));
+  vec4f caz = v_nmsub(cy, ax, v_mul(cx, ay));
+  vec4f den = v_madd(ax, bcx, v_madd(ay, bcy, v_mul(az, bcz)));
+  vec4f inv = v_rcp(den);
+  px = v_mul(v_nmsub(abx, cw, v_nmsub(cax, bw, v_nmsub(bcx, aw, v_zero()))), inv);
+  py = v_mul(v_nmsub(aby, cw, v_nmsub(cay, bw, v_nmsub(bcy, aw, v_zero()))), inv);
+  pz = v_mul(v_nmsub(abz, cw, v_nmsub(caz, bw, v_nmsub(bcz, aw, v_zero()))), inv);
+}
+
 VECTORCALL VECMATH_FINLINE void v_frustum_box_unsafe(bbox3f& box,
                                  vec4f camPlanes0, vec4f camPlanes1, vec4f camPlanes2,
                                  const vec4f &camPlanes3, const vec4f &camPlanes4, const vec4f &camPlanes5)
 {
-  vec3f invalid;
-  box.bmax = box.bmin = three_plane_intersection(camPlanes5, camPlanes2, camPlanes1, invalid);
-  v_bbox3_add_pt(box, three_plane_intersection(camPlanes4, camPlanes2, camPlanes1, invalid));
-  v_bbox3_add_pt(box, three_plane_intersection(camPlanes5, camPlanes3, camPlanes1, invalid));
-  v_bbox3_add_pt(box, three_plane_intersection(camPlanes4, camPlanes3, camPlanes1, invalid));
-  v_bbox3_add_pt(box, three_plane_intersection(camPlanes5, camPlanes2, camPlanes0, invalid));
-  v_bbox3_add_pt(box, three_plane_intersection(camPlanes4, camPlanes2, camPlanes0, invalid));
-  v_bbox3_add_pt(box, three_plane_intersection(camPlanes5, camPlanes3, camPlanes0, invalid));
-  v_bbox3_add_pt(box, three_plane_intersection(camPlanes4, camPlanes3, camPlanes0, invalid));
+  // the 8 corners are (P5|P4, P2|P3, P1|P0) triples; solve them lane-parallel in two
+  // batches of 4 with a = (P5,P4,P5,P4), b = (P2,P2,P3,P3) and c = P1 / P0
+  vec4f m01 = v_merge_hw(camPlanes5, camPlanes4); // 5x 4x 5y 4y
+  vec4f m23 = v_merge_lw(camPlanes5, camPlanes4); // 5z 4z 5w 4w
+  vec4f ax = v_perm_xyxy(m01), ay = v_perm_zwcd(m01, m01);
+  vec4f az = v_perm_xyxy(m23), aw = v_perm_zwcd(m23, m23);
+  vec4f n01 = v_merge_hw(camPlanes2, camPlanes3); // 2x 3x 2y 3y
+  vec4f n23 = v_merge_lw(camPlanes2, camPlanes3); // 2z 3z 2w 3w
+  vec4f bx = v_perm_xxyy(n01), by = v_perm_zzww(n01);
+  vec4f bz = v_perm_xxyy(n23), bw = v_perm_zzww(n23);
+
+  vec4f abx = v_nmsub(az, by, v_mul(ay, bz)); // a x b
+  vec4f aby = v_nmsub(ax, bz, v_mul(az, bx));
+  vec4f abz = v_nmsub(ay, bx, v_mul(ax, by));
+
+  vec4f px0, py0, pz0, px1, py1, pz1;
+  v_frustum_corners_4(ax, ay, az, aw, bx, by, bz, bw, abx, aby, abz, camPlanes1, px0, py0, pz0);
+  v_frustum_corners_4(ax, ay, az, aw, bx, by, bz, bw, abx, aby, abz, camPlanes0, px1, py1, pz1);
+
+  vec4f minx = v_min(px0, px1), maxx = v_max(px0, px1);
+  vec4f miny = v_min(py0, py1), maxy = v_max(py0, py1);
+  vec4f minz = v_min(pz0, pz1), maxz = v_max(pz0, pz1);
+  // pairwise trees reduce the three components and pack the bound in one go: (x, y, z, z)
+  box.bmin = v_min_pairs(v_min_pairs(minx, miny), v_min_pairs(minz, minz));
+  box.bmax = v_max_pairs(v_max_pairs(maxx, maxy), v_max_pairs(maxz, maxz));
 }
 
 VECTORCALL VECMATH_FINLINE int v_is_visible_sphere(vec3f center, vec3f r,
@@ -2120,32 +2195,30 @@ VECTORCALL VECMATH_FINLINE int v_is_visible_sphere(vec3f center, vec3f r,
   res03 = v_or(res03, v_add(v_add(v_dot3(center, plane4), r), v_splat_w(plane4)));
   res03 = v_or(res03, v_add(v_add(v_dot3(center, plane5), r), v_splat_w(plane5)));
 
-  return v_test_vec_mask_eq_0(res03);
+  return !v_is_any_neg_b(res03); // inside if no plane distance is negative
 }
 
 VECTORCALL VECMATH_FINLINE int v_sphere_intersect(vec3f center, vec3f r,
                   vec3f plane03X, const vec4f& plane03Y, const vec4f& plane03Z, const vec4f& plane03W,
                   const vec4f& plane4, const vec4f& plane5)
 {
-  vec4f res03;
-  res03 = v_madd(v_splat_x(center), plane03X, plane03W);
-  res03 = v_madd(v_splat_y(center), plane03Y, res03);
-  res03 = v_madd(v_splat_z(center), plane03Z, res03);
-  res03 = v_add(res03, r);
-  res03 = v_or(res03, v_add(v_add(v_dot3(center, plane4), r), v_splat_w(plane4)));
-  res03 = v_or(res03, v_add(v_add(v_dot3(center, plane5), r), v_splat_w(plane5)));
+  // the +r and -r bounds share the center's plane distances; compute them once
+  vec4f base = v_madd(v_splat_x(center), plane03X, plane03W);
+  base = v_madd(v_splat_y(center), plane03Y, base);
+  base = v_madd(v_splat_z(center), plane03Z, base);
+  vec4f d4 = v_dot3(center, plane4), w4 = v_splat_w(plane4);
+  vec4f d5 = v_dot3(center, plane5), w5 = v_splat_w(plane5);
 
-  if (v_test_vec_mask_neq_0(res03))
+  vec4f res = v_add(base, r);
+  res = v_or(res, v_add(v_add(d4, r), w4));
+  res = v_or(res, v_add(v_add(d5, r), w5));
+  if (v_is_any_neg_b(res)) // near bound outside a plane -> sphere fully outside
     return 0;
 
-  res03 = v_madd(v_splat_x(center), plane03X, plane03W);
-  res03 = v_madd(v_splat_y(center), plane03Y, res03);
-  res03 = v_madd(v_splat_z(center), plane03Z, res03);
-  res03 = v_sub(res03, r);
-  res03 = v_or(res03, v_add(v_sub(v_dot3(center, plane4), r), v_splat_w(plane4)));
-  res03 = v_or(res03, v_add(v_sub(v_dot3(center, plane5), r), v_splat_w(plane5)));
-
-  return v_test_vec_mask_neq_0(res03) + 1;
+  res = v_sub(base, r);
+  res = v_or(res, v_add(v_sub(d4, r), w4));
+  res = v_or(res, v_add(v_sub(d5, r), w5));
+  return v_is_any_neg_b(res) + 1; // far bound crosses a plane -> intersects, else fully inside
 }
 
 // not 100% correct: OUTSIDE cases may be reported as INTERSECT (in practice this is VERY rare, mostly for huge boxes)
@@ -2161,7 +2234,7 @@ VECTORCALL VECMATH_FINLINE int v_is_visible_box_extent2(vec3f center, vec3f exte
   res03 = v_or(res03, v_add(v_dot3(v_add(v_xor(extent, v_and(plane4W2, signmask)), center), plane4W2), v_splat_w(plane4W2)));
   res03 = v_or(res03, v_add(v_dot3(v_add(v_xor(extent, v_and(plane5W2, signmask)), center), plane5W2), v_splat_w(plane5W2)));
 
-  return v_test_vec_mask_eq_0(res03);
+  return !v_is_any_neg_b(res03); // inside if no plane distance is negative
 }
 
 // not 100% correct: OUTSIDE cases may be reported as INTERSECT (in practice this is VERY rare, mostly for huge boxes)
@@ -2170,24 +2243,33 @@ VECTORCALL VECMATH_FINLINE int v_box_frustum_intersect_extent2(vec3f center, vec
                   vec4f plane03X, const vec4f& plane03Y, const vec4f& plane03Z, const vec4f& plane03W2,
                   const vec4f& plane4W2, const vec4f& plane5W2)
 {
+  // sign(plane)*extent per axis is the same for the p- and n-vertex; compute it (and the
+  // center splats / plane w) once and reuse across both bounds
   vec4f signmask = v_cast_vec4f(V_CI_SIGN_MASK);
-  vec4f res03;
-  res03 = v_madd(v_add(v_splat_x(center), v_xor(v_splat_x(extent), v_and(plane03X, signmask))), plane03X, plane03W2);
-  res03 = v_madd(v_add(v_splat_y(center), v_xor(v_splat_y(extent), v_and(plane03Y, signmask))), plane03Y, res03);
-  res03 = v_madd(v_add(v_splat_z(center), v_xor(v_splat_z(extent), v_and(plane03Z, signmask))), plane03Z, res03);
-  res03 = v_or(res03, v_add(v_dot3(v_add(v_xor(extent, v_and(plane4W2, signmask)), center), plane4W2), v_splat_w(plane4W2)));
-  res03 = v_or(res03, v_add(v_dot3(v_add(v_xor(extent, v_and(plane5W2, signmask)), center), plane5W2), v_splat_w(plane5W2)));
+  vec4f cx = v_splat_x(center), cy = v_splat_y(center), cz = v_splat_z(center);
+  vec4f eX = v_xor(v_splat_x(extent), v_and(plane03X, signmask));
+  vec4f eY = v_xor(v_splat_y(extent), v_and(plane03Y, signmask));
+  vec4f eZ = v_xor(v_splat_z(extent), v_and(plane03Z, signmask));
+  vec4f e4 = v_xor(extent, v_and(plane4W2, signmask)), w4 = v_splat_w(plane4W2);
+  vec4f e5 = v_xor(extent, v_and(plane5W2, signmask)), w5 = v_splat_w(plane5W2);
 
-  if (v_test_vec_mask_neq_0(res03))
+  vec4f res03;
+  res03 = v_madd(v_add(cx, eX), plane03X, plane03W2);
+  res03 = v_madd(v_add(cy, eY), plane03Y, res03);
+  res03 = v_madd(v_add(cz, eZ), plane03Z, res03);
+  res03 = v_or(res03, v_add(v_dot3(v_add(e4, center), plane4W2), w4));
+  res03 = v_or(res03, v_add(v_dot3(v_add(e5, center), plane5W2), w5));
+
+  if (v_is_any_neg_b(res03)) // p-vertex outside a plane -> box fully outside
     return 0;
 
-  res03 = v_madd(v_sub(v_splat_x(center), v_xor(v_splat_x(extent), v_and(plane03X, signmask))), plane03X, plane03W2);
-  res03 = v_madd(v_sub(v_splat_y(center), v_xor(v_splat_y(extent), v_and(plane03Y, signmask))), plane03Y, res03);
-  res03 = v_madd(v_sub(v_splat_z(center), v_xor(v_splat_z(extent), v_and(plane03Z, signmask))), plane03Z, res03);
-  res03 = v_or(res03, v_add(v_dot3(v_sub(center, v_xor(extent, v_and(plane4W2, signmask))), plane4W2), v_splat_w(plane4W2)));
-  res03 = v_or(res03, v_add(v_dot3(v_sub(center, v_xor(extent, v_and(plane5W2, signmask))), plane5W2), v_splat_w(plane5W2)));
+  res03 = v_madd(v_sub(cx, eX), plane03X, plane03W2);
+  res03 = v_madd(v_sub(cy, eY), plane03Y, res03);
+  res03 = v_madd(v_sub(cz, eZ), plane03Z, res03);
+  res03 = v_or(res03, v_add(v_dot3(v_sub(center, e4), plane4W2), w4));
+  res03 = v_or(res03, v_add(v_dot3(v_sub(center, e5), plane5W2), w5));
 
-  return v_test_vec_mask_neq_0(res03) + 1;
+  return v_is_any_neg_b(res03) + 1;
 }
 
 VECTORCALL VECMATH_FINLINE int v_is_visible_extent_fast(vec3f center, vec3f extent, mat44f_cref clip)//center and extent should be multiplied by 2
@@ -2238,8 +2320,7 @@ VECTORCALL VECMATH_FINLINE int v_is_visible_box_extent2(vec3f center, vec3f exte
   res47 = v_madd(v_add(v_splat_y(center), v_xor(v_splat_y(extent), v_and(plane47Y, signmask))), plane47Y, res47);
   res47 = v_madd(v_add(v_splat_z(center), v_xor(v_splat_z(extent), v_and(plane47Z, signmask))), plane47Z, res47);
 
-  int result = v_signmask(v_or(res03, res47));
-  return (~unsigned(-result))>>31;
+  return !v_is_any_neg_b(v_or(res03, res47)); // inside if no plane distance is negative
 }
 
 VECTORCALL VECMATH_FINLINE int v_box_frustum_intersect_extent2(vec3f center, vec3f extent,//center and extent should be multiplied by 2
@@ -2262,13 +2343,10 @@ VECTORCALL VECMATH_FINLINE int v_box_frustum_intersect_extent2(vec3f center, vec
   res47Add = v_madd(v_xor(v_splat_y(extent), v_and(plane47Y, signmask)), plane47Y, res47Add);
   res47Add = v_madd(v_xor(v_splat_z(extent), v_and(plane47Z, signmask)), plane47Z, res47Add);
 
-  int result = v_signmask(v_or(v_add(res03Base, res03Add), v_add(res47Base, res47Add)));
-  if ((unsigned(-result))>>31)
+  if (v_is_any_neg_b(v_or(v_add(res03Base, res03Add), v_add(res47Base, res47Add))))
     return 0;
 
-  result = v_signmask(v_or(v_sub(res03Base, res03Add), v_sub(res47Base, res47Add)));
-  return ((unsigned(-result))>>31) + 1;
-  //*/
+  return v_is_any_neg_b(v_or(v_sub(res03Base, res03Add), v_sub(res47Base, res47Add))) + 1;
 }
 
 VECTORCALL VECMATH_FINLINE int v_is_visible_sphere(vec3f center, vec3f r,
@@ -2283,8 +2361,7 @@ VECTORCALL VECMATH_FINLINE int v_is_visible_sphere(vec3f center, vec3f r,
   res47 = v_madd(v_splat_y(center), plane47Y, res47);
   res47 = v_madd(v_splat_z(center), plane47Z, res47);
   res03 = v_or(v_add(res03, r), v_add(res47, r));
-  int result = v_signmask(res03);
-  return (~unsigned(-result))>>31;
+  return !v_is_any_neg_b(res03); // inside if no plane distance is negative
 }
 
 VECTORCALL VECMATH_FINLINE int v_sphere_intersect(vec3f center, vec3f r,
@@ -2299,13 +2376,11 @@ VECTORCALL VECMATH_FINLINE int v_sphere_intersect(vec3f center, vec3f r,
   res47 = v_madd(v_splat_y(center), plane47Y, res47);
   res47 = v_madd(v_splat_z(center), plane47Z, res47);
   vec4f resOut = v_or(v_add(res03, r), v_add(res47, r));
-  int result = v_signmask(resOut);
-  if ((unsigned(-result))>>31)
+  if (v_is_any_neg_b(resOut))
     return 0;
 
   vec4f resIn = v_or(v_sub(res03, r), v_sub(res47, r));
-  result = v_signmask(resIn);
-  return ((unsigned(-result))>>31) + 1;
+  return v_is_any_neg_b(resIn) + 1;
 }
 
 VECTORCALL VECMATH_FINLINE int v_is_visible_extent_fast_8planes(vec3f center, vec3f extent, mat44f_cref clip)//just correct box extents, not multiplied
@@ -2336,175 +2411,43 @@ alignas(16) static float v_screen_div_eps[4] = {0.0001f,0.0001f,0.0001f,0.0001f}
 ///return zero if not visible in frustum or if bbox screen size is smaller, than threshold. not zero, otherwise
 // also, screen_box is minX, maxX, minY, maxY - in clipspace coordinates  (-1, -1) .. (1,1)
 
-VECTORCALL VECMATH_FINLINE int v_screen_size_b(vec3f bmin, vec3f bmax, vec3f threshold, vec4f &screen_box, mat44f_cref clip)
+VECTORCALL VECMATH_INLINE int v_screen_size_b(vec3f bmin, vec3f bmax, vec3f threshold, vec4f &screen_box, mat44f_cref clip)
 {
-  // get aabb points (SoA)
-  vec4f minmax_x = v_perm_xXxX(bmin, bmax);
-  vec4f minmax_y = v_perm_yyYY(bmin, bmax);
-  vec4f minmax_z_0 = v_splat_z(bmin);
-  vec4f minmax_z_1 = v_splat_z(bmax);
+  vec4f cs0[4], cs1[4], cs0_negw, cs1_negw;
+  v_is_transform_box_8(bmin, bmax, clip, cs0, cs1, cs0_negw, cs1_negw);
 
-  // transform points to clip space
-  vec4f points_cs_0[4];
-  vec4f points_cs_1[4];
-
-  vis_transform_points_4(points_cs_0, minmax_x, minmax_y, minmax_z_0, clip);
-  vis_transform_points_4(points_cs_1, minmax_x, minmax_y, minmax_z_1, clip);
-
-  // calculate -w
-  vec4f points_cs_0_negw = v_neg(points_cs_0[3]);
-  vec4f points_cs_1_negw = v_neg(points_cs_1[3]);
-
-#if _TARGET_SIMD_SSE
-  #define NOUT(a, b, c, d) (unsigned(-_mm_movemask_ps(v_or(v_cmp_gt(a, b), v_cmp_gt(c, d)))))
-  unsigned nout;
-  nout = (NOUT(points_cs_0[0], points_cs_0_negw, points_cs_1[0], points_cs_1_negw));
-  nout &= (NOUT(points_cs_0[3], points_cs_0[0], points_cs_1[3], points_cs_1[0]));
-  nout &= (NOUT(points_cs_0[1], points_cs_0_negw, points_cs_1[1], points_cs_1_negw));
-  nout &= (NOUT(points_cs_0[3], points_cs_0[1], points_cs_1[3], points_cs_1[1]));
-  nout &= (NOUT(points_cs_0[2], v_zero(), points_cs_1[2], v_zero()));
-  nout &= (NOUT(points_cs_0[3], points_cs_0[2], points_cs_1[3], points_cs_1[2]));
-
-  // merge "not outside" flags
-  if ((nout&(1<<31)) == 0)
+  if (!v_is_frustum_nout_8(cs0, cs0_negw, cs1, cs1_negw)) // outside at least one plane
     return 0;
 
-#else
-  #define NOUT(a, b, c, d) v_hor(v_or(v_cmp_gt(a, b), v_cmp_gt(c, d)))
-  vec4f nout0 = NOUT(points_cs_0[0], points_cs_0_negw, points_cs_1[0], points_cs_1_negw);
-  vec4f nout1 = NOUT(points_cs_0[3], points_cs_0[0], points_cs_1[3], points_cs_1[0]);
-  vec4f nout2 = NOUT(points_cs_0[1], points_cs_0_negw, points_cs_1[1], points_cs_1_negw);
-  vec4f nout3 = NOUT(points_cs_0[3], points_cs_0[1], points_cs_1[3], points_cs_1[1]);
-  vec4f nout4 = NOUT(points_cs_0[2], v_zero(), points_cs_1[2], v_zero());
-  vec4f nout5 = NOUT(points_cs_0[3], points_cs_0[2], points_cs_1[3], points_cs_1[2]);
-
-  // merge "not outside" flags
-  vec4f nout01 = v_and(nout0, nout1);
-  vec4f nout012 = v_and(nout01, nout2);
-
-  vec4f nout34 = v_and(nout3, nout4);
-  vec4f nout345 = v_and(nout34, nout5);
-
-  vec4f nout = v_and(nout012, nout345);
-
-  if (v_test_vec_x_eqi_0(nout)) //"not outside"=0 -> outside=1
-    return 0;
-
-#endif
-  #undef NOUT
   vec4f eps = *(vec4f*)v_screen_div_eps;
-  vec4f valid_cs_0 = v_cmp_gt(points_cs_0[3], eps);
-  vec4f valid_cs_1 = v_cmp_gt(points_cs_1[3], eps);
-  vec4f valid_cs = v_and(valid_cs_0, valid_cs_1);
-
-  #if _TARGET_SIMD_SSE
-  if (_mm_movemask_ps(valid_cs) != 15)
-  #else
-  valid_cs = v_and(valid_cs, v_rot_1(valid_cs));//xy, yz, zw, wx
-  valid_cs = v_and(valid_cs, v_rot_2(valid_cs));//xyzw,yzwx, zwxy, wxyz
-  if (v_test_vec_x_eqi_0(valid_cs))
-  #endif
+  vec4f valid_cs = v_and(v_cmp_gt(cs0[3], eps), v_cmp_gt(cs1[3], eps));
+  if (!v_check_xyzw_all_true(valid_cs))
   {
     screen_box = *(vec4f*)v_screen_full_screen;
     return -1;
   }
 
-  vec4f inv_cs0_3 = v_rcp(points_cs_0[3]);
-  vec4f inv_cs1_3 = v_rcp(points_cs_1[3]);
-  vec4f xxxx0 = v_mul(points_cs_0[0], inv_cs0_3);
-  vec4f xxxx1 = v_mul(points_cs_1[0], inv_cs1_3);
-  vec4f yyyy0 = v_mul(points_cs_0[1], inv_cs0_3);
-  vec4f yyyy1 = v_mul(points_cs_1[1], inv_cs1_3);
-
-  vec4f point01 = v_merge_hw(xxxx0, yyyy0);//xy, xy
-  vec4f point23 = v_merge_lw(xxxx0, yyyy0);//xy, xy
-  vec4f point45 = v_merge_hw(xxxx1, yyyy1);//xy, xy
-  vec4f point67 = v_merge_lw(xxxx1, yyyy1);//xy, xy
-  vec4f minXY = v_min(v_min(point01, point23), v_min(point45, point67));
-  minXY = v_min(minXY, v_rot_2(minXY));
-  vec4f maxXY = v_max(v_max(point01, point23), v_max(point45, point67));
-  maxXY = v_max(maxXY, v_rot_2(maxXY));
-
-  screen_box = v_merge_hw(minXY, maxXY);
-  vec4f screenSizeVisible = v_sub(maxXY, minXY);
-  screenSizeVisible = v_cmp_ge(threshold, screenSizeVisible);
-  #if _TARGET_SIMD_SSE
-  if ((_mm_movemask_ps(screenSizeVisible)&3) != 0)
-    return 0;
-  #else
-  screenSizeVisible = v_or(screenSizeVisible, v_rot_1(screenSizeVisible));
-  if (!v_test_vec_x_eqi_0(screenSizeVisible))
-    return 0;
-  #endif
-  return 1;
+  vec4f min0, max0, min1, max1;
+  v_is_screen_project_minmax(cs0, min0, max0);
+  v_is_screen_project_minmax(cs1, min1, max1);
+  return v_is_screen_finish(v_min(min0, min1), v_max(max0, max1), threshold, screen_box);
 }
 
 ///return zero if not visible in frustum or if bbox screen size is smaller, than threshold. 1, if all vertex are in front of near plane, -1 (and fullscreen rect) otherwise
 // also, screen_box is minX, maxX, minY, maxY - in clipspace coordinates  (-1, -1) .. (1,1), minmax_w is wWwW (minw, maxw, minw, maxw)
-VECTORCALL VECMATH_FINLINE int
+VECTORCALL VECMATH_INLINE int
   v_screen_size_b(vec3f bmin, vec3f bmax, vec3f threshold, vec4f &screen_box, vec4f &minmax_w, mat44f_cref clip)
 {
-  // get aabb points (SoA)
-  vec4f minmax_x = v_perm_xXxX(bmin, bmax);
-  vec4f minmax_y = v_perm_yyYY(bmin, bmax);
-  vec4f minmax_z_0 = v_splat_z(bmin);
-  vec4f minmax_z_1 = v_splat_z(bmax);
+  vec4f cs0[4], cs1[4], cs0_negw, cs1_negw;
+  v_is_transform_box_8(bmin, bmax, clip, cs0, cs1, cs0_negw, cs1_negw);
 
-  // transform points to clip space
-  vec4f points_cs_0[4];
-  vec4f points_cs_1[4];
-
-  vis_transform_points_4(points_cs_0, minmax_x, minmax_y, minmax_z_0, clip);
-  vis_transform_points_4(points_cs_1, minmax_x, minmax_y, minmax_z_1, clip);
-
-  // calculate -w
-  vec4f points_cs_0_negw = v_neg(points_cs_0[3]);
-  vec4f points_cs_1_negw = v_neg(points_cs_1[3]);
-
-#if _TARGET_SIMD_SSE
-  #define NOUT(a, b, c, d) (unsigned(-_mm_movemask_ps(v_or(v_cmp_gt(a, b), v_cmp_gt(c, d)))))
-  unsigned nout;
-  nout = (NOUT(points_cs_0[0], points_cs_0_negw, points_cs_1[0], points_cs_1_negw));
-  nout &= (NOUT(points_cs_0[3], points_cs_0[0], points_cs_1[3], points_cs_1[0]));
-  nout &= (NOUT(points_cs_0[1], points_cs_0_negw, points_cs_1[1], points_cs_1_negw));
-  nout &= (NOUT(points_cs_0[3], points_cs_0[1], points_cs_1[3], points_cs_1[1]));
-  nout &= (NOUT(points_cs_0[2], v_zero(), points_cs_1[2], v_zero()));
-  nout &= (NOUT(points_cs_0[3], points_cs_0[2], points_cs_1[3], points_cs_1[2]));
-
-  // merge "not outside" flags
-  if ((nout&(1<<31)) == 0)
+  if (!v_is_frustum_nout_8(cs0, cs0_negw, cs1, cs1_negw)) // outside at least one plane
     return 0;
 
-#else
-  #define NOUT(a, b, c, d) v_hor(v_or(v_cmp_gt(a, b), v_cmp_gt(c, d)))
-  vec4f nout0 = NOUT(points_cs_0[0], points_cs_0_negw, points_cs_1[0], points_cs_1_negw);
-  vec4f nout1 = NOUT(points_cs_0[3], points_cs_0[0], points_cs_1[3], points_cs_1[0]);
-  vec4f nout2 = NOUT(points_cs_0[1], points_cs_0_negw, points_cs_1[1], points_cs_1_negw);
-  vec4f nout3 = NOUT(points_cs_0[3], points_cs_0[1], points_cs_1[3], points_cs_1[1]);
-  vec4f nout4 = NOUT(points_cs_0[2], v_zero(), points_cs_1[2], v_zero());
-  vec4f nout5 = NOUT(points_cs_0[3], points_cs_0[2], points_cs_1[3], points_cs_1[2]);
-
-  // merge "not outside" flags
-  vec4f nout01 = v_and(nout0, nout1);
-  vec4f nout012 = v_and(nout01, nout2);
-
-  vec4f nout34 = v_and(nout3, nout4);
-  vec4f nout345 = v_and(nout34, nout5);
-
-  vec4f nout = v_and(nout012, nout345);
-
-  if (v_test_vec_x_eqi_0(nout)) //"not outside"=0 -> outside=1
-    return 0;
-
-#endif
-  #undef NOUT
-  vec4f min_w = v_min(points_cs_0[3], points_cs_1[3]);
-  min_w = v_min(min_w, v_rot_2(min_w));
-  min_w = v_min(min_w, v_rot_1(min_w));
-
-  vec4f max_w = v_max(points_cs_0[3], points_cs_1[3]);
-  max_w = v_max(max_w, v_rot_2(max_w));
-  minmax_w = v_perm_xaxa(min_w, v_max(max_w, v_rot_1(max_w)));
+  // horizontal reduce of the 8 corner w's; on NEON these fold to fminv/fmaxv
+  vec4f min_w = v_hmin(v_min(cs0[3], cs1[3]));
+  vec4f max_w = v_hmax(v_max(cs0[3], cs1[3]));
+  minmax_w = v_perm_xaxa(min_w, max_w);
 
   vec4f eps = *(vec4f*)v_screen_div_eps;
   if (v_test_vec_x_lt(min_w, eps))
@@ -2513,34 +2456,47 @@ VECTORCALL VECMATH_FINLINE int
     return -1;
   }
 
-  vec4f inv_cs0_3 = v_rcp(points_cs_0[3]);
-  vec4f inv_cs1_3 = v_rcp(points_cs_1[3]);
-  vec4f xxxx0 = v_mul(points_cs_0[0], inv_cs0_3);
-  vec4f xxxx1 = v_mul(points_cs_1[0], inv_cs1_3);
-  vec4f yyyy0 = v_mul(points_cs_0[1], inv_cs0_3);
-  vec4f yyyy1 = v_mul(points_cs_1[1], inv_cs1_3);
+  vec4f min0, max0, min1, max1;
+  v_is_screen_project_minmax(cs0, min0, max0);
+  v_is_screen_project_minmax(cs1, min1, max1);
+  return v_is_screen_finish(v_min(min0, min1), v_max(max0, max1), threshold, screen_box);
+}
 
-  vec4f point01 = v_merge_hw(xxxx0, yyyy0);//xy, xy
-  vec4f point23 = v_merge_lw(xxxx0, yyyy0);//xy, xy
-  vec4f point45 = v_merge_hw(xxxx1, yyyy1);//xy, xy
-  vec4f point67 = v_merge_lw(xxxx1, yyyy1);//xy, xy
-  vec4f minXY = v_min(v_min(point01, point23), v_min(point45, point67));
-  minXY = v_min(minXY, v_rot_2(minXY));
-  vec4f maxXY = v_max(v_max(point01, point23), v_max(point45, point67));
-  maxXY = v_max(maxXY, v_rot_2(maxXY));
+// as v_screen_size_b above, contract: the box is already frustum-classified as at least partially
+// visible. Only the x, y, w clip rows are computed (clip z is consumed solely by the frustum planes,
+// which are skipped), so the minmax_w / screen rect math is the same FP ops as v_screen_size_b and the
+// outputs are bit-identical whenever the contract holds; a fully-outside box yields meaningless (but
+// safe) outputs instead of the 0 return.
+VECTORCALL VECMATH_INLINE int
+  v_screen_size_visible_b(vec3f bmin, vec3f bmax, vec3f threshold, vec4f &screen_box, vec4f &minmax_w, mat44f_cref clip)
+{
+  vec4f minmax_x = v_perm_xaxa(bmin, bmax);
+  vec4f minmax_y = v_perm_yybb(bmin, bmax);
+  vec4f minz = v_splat_z(bmin);
+  vec4f maxz = v_splat_z(bmax);
+  vec4f cs0[4], cs1[4]; // only the x, y, w rows are filled; [2] stays untouched (never read below)
+  v_is_transform_row_2z(minmax_x, minmax_y, minz, maxz, v_splat_x(clip.col0), v_splat_x(clip.col1), v_splat_x(clip.col2),
+    v_splat_x(clip.col3), cs0[0], cs1[0]);
+  v_is_transform_row_2z(minmax_x, minmax_y, minz, maxz, v_splat_y(clip.col0), v_splat_y(clip.col1), v_splat_y(clip.col2),
+    v_splat_y(clip.col3), cs0[1], cs1[1]);
+  v_is_transform_row_2z(minmax_x, minmax_y, minz, maxz, v_splat_w(clip.col0), v_splat_w(clip.col1), v_splat_w(clip.col2),
+    v_splat_w(clip.col3), cs0[3], cs1[3]);
 
-  screen_box = v_merge_hw(minXY, maxXY);
-  vec4f screenSizeVisible = v_sub(maxXY, minXY);
-  screenSizeVisible = v_cmp_ge(threshold, screenSizeVisible);
-  #if _TARGET_SIMD_SSE
-  if ((_mm_movemask_ps(screenSizeVisible)&3) != 0)
-    return 0;
-  #else
-  screenSizeVisible = v_or(screenSizeVisible, v_rot_1(screenSizeVisible));
-  if (!v_test_vec_x_eqi_0(screenSizeVisible))
-    return 0;
-  #endif
-  return 1;
+  vec4f min_w = v_hmin(v_min(cs0[3], cs1[3]));
+  vec4f max_w = v_hmax(v_max(cs0[3], cs1[3]));
+  minmax_w = v_perm_xaxa(min_w, max_w);
+
+  vec4f eps = *(vec4f *)v_screen_div_eps;
+  if (v_test_vec_x_lt(min_w, eps))
+  {
+    screen_box = *(vec4f *)v_screen_full_screen;
+    return -1;
+  }
+
+  vec4f min0, max0, min1, max1;
+  v_is_screen_project_minmax(cs0, min0, max0);
+  v_is_screen_project_minmax(cs1, min1, max1);
+  return v_is_screen_finish(v_min(min0, min1), v_max(max0, max1), threshold, screen_box);
 }
 
 //universal visibility function (accepts worldviewproj matrix)
@@ -2548,89 +2504,35 @@ VECTORCALL VECMATH_FINLINE int
 ///return zero if not visible in frustum or if bbox screen size is smaller, than threshold. not zero, otherwise
 // also, screen_box is minX, maxX, minY, maxY - in clipspace coordinates  (-1, -1) .. (1,1)
 
-VECTORCALL VECMATH_FINLINE int v_screen_size_b(vec3f box2_xyXY, vec3f threshold, vec4f &screen_box, mat44f_cref clip)
+VECTORCALL VECMATH_INLINE int v_screen_size_b(vec3f box2_xyXY, vec3f threshold, vec4f &screen_box, mat44f_cref clip)
 {
-  // get aabb points (SoA)
+  // get aabb points (SoA); a single z-slice, box2_xyXY is a 2D box
   vec4f minmax_x = v_perm_xzxz(box2_xyXY);
   vec4f minmax_y = v_perm_yyww(box2_xyXY);
 
-  // transform points to clip space
   vec4f points_cs_0[4];
-
-  vis_transform_points_4(points_cs_0, minmax_x, minmax_y, clip);
-
-  // calculate -w
+  v_is_transform_points_4(points_cs_0, minmax_x, minmax_y, clip);
   vec4f points_cs_0_negw = v_neg(points_cs_0[3]);
 
-#if _TARGET_SIMD_SSE
-  #define NOUT(a, b) (unsigned(-_mm_movemask_ps(v_cmp_gt(a, b))))
-  unsigned nout;
-  nout = (NOUT(points_cs_0[0], points_cs_0_negw));
-  nout &= (NOUT(points_cs_0[3], points_cs_0[0]));
-  nout &= (NOUT(points_cs_0[1], points_cs_0_negw));
-  nout &= (NOUT(points_cs_0[3], points_cs_0[1]));
-  nout &= (NOUT(points_cs_0[2], v_zero()));
-  nout &= (NOUT(points_cs_0[3], points_cs_0[2]));
+  vec4f *cs = points_cs_0;
+  if (!v_is_merge_planes_nout(v_cmp_gt(cs[0], points_cs_0_negw),  // -w <= x
+        v_cmp_gt(cs[3], cs[0]),                                  //  x <= w
+        v_cmp_gt(cs[1], points_cs_0_negw),                       // -w <= y
+        v_cmp_gt(cs[3], cs[1]),                                  //  y <= w
+        v_cmp_gt(cs[2], v_zero()),                               //  0 <= z
+        v_cmp_gt(cs[3], cs[2])))                                 //  z <= w
+    return 0; // outside at least one plane
 
-  // merge "not outside" flags
-  if ((nout&(1<<31)) == 0)
-    return 0;
-
-#else
-  #define NOUT(a, b) v_hor(v_cmp_gt(a, b))
-  vec4f nout0 = NOUT(points_cs_0[0], points_cs_0_negw);
-  vec4f nout1 = NOUT(points_cs_0[3], points_cs_0[0]);
-  vec4f nout2 = NOUT(points_cs_0[1], points_cs_0_negw);
-  vec4f nout3 = NOUT(points_cs_0[3], points_cs_0[1]);
-  vec4f nout4 = NOUT(points_cs_0[2], v_zero());
-  vec4f nout5 = NOUT(points_cs_0[3], points_cs_0[2]);
-
-  // merge "not outside" flags
-  vec4f nout01 = v_and(nout0, nout1);
-  vec4f nout012 = v_and(nout01, nout2);
-
-  vec4f nout34 = v_and(nout3, nout4);
-  vec4f nout345 = v_and(nout34, nout5);
-
-  vec4f nout = v_and(nout012, nout345);
-
-  if (v_test_vec_x_eqi_0(nout)) //"not outside"=0 -> outside=1
-    return 0;
-
-#endif
-  #undef NOUT
   vec4f eps = *(vec4f*)v_screen_div_eps;
-  vec4f valid_cs = v_cmp_gt(points_cs_0[3], eps);
-
-  if (!v_test_all_bits_ones(valid_cs))
+  if (!v_test_all_bits_ones(v_cmp_gt(points_cs_0[3], eps)))
   {
     screen_box = *(vec4f*)v_screen_full_screen;
     return -1;
   }
 
-  vec4f inv_cs0_3 = v_rcp(points_cs_0[3]);
-  vec4f xxxx0 = v_mul(points_cs_0[0], inv_cs0_3);
-  vec4f yyyy0 = v_mul(points_cs_0[1], inv_cs0_3);
-
-  vec4f point01 = v_merge_hw(xxxx0, yyyy0);//xy, xy
-  vec4f point23 = v_merge_lw(xxxx0, yyyy0);//xy, xy
-  vec4f minXY = v_min(point01, point23);
-  minXY = v_min(minXY, v_rot_2(minXY));
-  vec4f maxXY = v_max(point01, point23);
-  maxXY = v_max(maxXY, v_rot_2(maxXY));
-
-  screen_box = v_merge_hw(minXY, maxXY);
-  vec4f screenSizeVisible = v_sub(maxXY, minXY);
-  screenSizeVisible = v_cmp_ge(threshold, screenSizeVisible);
-  #if _TARGET_SIMD_SSE
-  if ((_mm_movemask_ps(screenSizeVisible)&3) != 0)
-    return 0;
-  #else
-  screenSizeVisible = v_or(screenSizeVisible, v_rot_1(screenSizeVisible));
-  if (!v_test_vec_x_eqi_0(screenSizeVisible))
-    return 0;
-  #endif
-  return 1;
+  vec4f minXY, maxXY;
+  v_is_screen_project_minmax(points_cs_0, minXY, maxXY);
+  return v_is_screen_finish(minXY, maxXY, threshold, screen_box);
 }
 
 
@@ -2737,7 +2639,7 @@ VECTORCALL inline int v_segment_box_intersection_side(vec3f start, vec3f end, co
   out_at_min = v_extract_x(vSide);
   out_at_max = v_extract_x(v_sel(vEnter, vExit, validExit));
 
-  int axisMask = v_signmask(v_cmp_eq(ref, vSide)) & 0b111;
+  int axisMask = v_truemask(v_cmp_eq(ref, vSide)) & 0b111;
 #if defined(__clang__) || defined(__GNUC__)
   int axis = __builtin_ctz(axisMask);
 #else
@@ -2746,7 +2648,7 @@ VECTORCALL inline int v_segment_box_intersection_side(vec3f start, vec3f end, co
 #endif
 
   // prefer the bmin face on ties (t0 == t1), matching the original scan order
-  int isMax = (~v_signmask(v_cmp_eq(ref, t0)) >> axis) & 1;
+  int isMax = (~v_truemask(v_cmp_eq(ref, t0)) >> axis) & 1;
   return axis + isMax * 3;
 }
 
@@ -2805,12 +2707,18 @@ VECMATH_FINLINE bool v_ray_sphere_intersection(vec3f start, vec3f dir, vec4f &t_
 
 VECTORCALL VECMATH_FINLINE void v_mat33_make_from_33cu(mat33f &tmV, const float *const __restrict m33)
 {
-  vec4f v0 = v_ldu(m33 + 0);
-  vec4f v1 = v_ldu(m33 + 4);
-  vec4f v2 = v_ldu_x(m33 + 8);
-  tmV.col0 = v0;
-  tmV.col1 = v_perm_wxyz(v_perm_xycd(v1, v0));
-  tmV.col2 = v_perm_zwxy(v_perm_ayzw(v1, v2));
+  // v_ldu_p3 keeps the trailing column read sanitizer-clean
+  tmV.col0 = v_perm_xyzd(v_ldu(m33 + 0), v_zero());
+  tmV.col1 = v_perm_xyzd(v_ldu(m33 + 3), v_zero());
+  tmV.col2 = v_perm_xyzd(v_ldu_p3(m33 + 6), v_zero());
+}
+
+VECTORCALL VECMATH_FINLINE void v_mat33_make_from_33cu_safe(mat33f &tmV, const float *const __restrict m33)
+{
+  // the first two loads stay within the 9 floats, only the tail needs the exact form
+  tmV.col0 = v_perm_xyzd(v_ldu(m33 + 0), v_zero());
+  tmV.col1 = v_perm_xyzd(v_ldu(m33 + 3), v_zero());
+  tmV.col2 = v_perm_xyzd(v_ldu_p3_safe(m33 + 6), v_zero());
 }
 
 VECTORCALL VECMATH_FINLINE void v_mat_44cu_from_mat44(float* __restrict m44, const mat44f& tm)
@@ -2819,6 +2727,14 @@ VECTORCALL VECMATH_FINLINE void v_mat_44cu_from_mat44(float* __restrict m44, con
   v_stu(m44 + 4, tm.col1);
   v_stu(m44 + 8, tm.col2);
   v_stu(m44 + 12, tm.col3);
+}
+
+VECTORCALL VECMATH_FINLINE void v_mat_44ca_from_mat44(float* __restrict m44, const mat44f& tm)
+{
+  v_st(m44 + 0, tm.col0);
+  v_st(m44 + 4, tm.col1);
+  v_st(m44 + 8, tm.col2);
+  v_st(m44 + 12, tm.col3);
 }
 
 //mat44f from unaligned 4x4 matrix
@@ -3001,13 +2917,13 @@ VECTORCALL VECMATH_FINLINE vec4f v_distance_sq_to_bbox_2d_x(vec4f bmin, vec4f bm
 
 VECTORCALL VECMATH_FINLINE vec4f v_distance_sq_box_to_box_x(vec3f centerA, vec3f extentA, vec3f centerB, vec3f extentB)
 {
-  vec3f axisDistances = v_max(v_sub(v_abs(v_sub(centerB, centerA)), v_add(extentA, extentB)), v_zero());
+  vec3f axisDistances = v_max(v_sub(v_abs_diff(centerB, centerA), v_add(extentA, extentB)), v_zero());
   return v_dot3_x(axisDistances, axisDistances);
 }
 
 VECTORCALL VECMATH_FINLINE vec4f v_distance_sq_box_to_box_x_scaled(vec3f centerA, vec3f extentA, vec3f centerB, vec3f extentB, vec3f scale)
 {
-  vec3f axisDistances = v_max(v_sub(v_abs(v_sub(centerB, centerA)), v_add(extentA, extentB)), v_zero());
+  vec3f axisDistances = v_max(v_sub(v_abs_diff(centerB, centerA), v_add(extentA, extentB)), v_zero());
   axisDistances = v_mul(axisDistances, scale);
   return v_dot3_x(axisDistances, axisDistances);
 }
@@ -3027,22 +2943,22 @@ VECTORCALL VECMATH_FINLINE vec3f v_closest_bbox_point(vec3f bmin, vec3f bmax, ve
 
 
 //returns point on infinite line which is closes to point
-VECTORCALL VECMATH_FINLINE vec3f closest_point_on_line(vec3f point, vec3f a, vec3f dir)
+VECTORCALL VECMATH_FINLINE vec3f v_closest_point_on_line(vec3f point, vec3f a, vec3f dir)
 {
   vec3f t = v_dot3(v_sub(point, a), dir);// t param along line
   return v_madd(dir, t, a);//pt is point on line
 }
 
-VECTORCALL VECMATH_FINLINE vec4f distance_to_line_x(vec3f point, vec3f a, vec3f dir)
+VECTORCALL VECMATH_FINLINE vec4f v_distance_to_line_x(vec3f point, vec3f a, vec3f dir)
 {
   vec3f pa = v_sub(point, a);
   vec3f t = v_dot3(pa, dir);// t param along line
   return v_length3_x(v_sub(pa, v_mul(dir, t)));
 }
 
-VECTORCALL VECMATH_FINLINE vec4f distance_to_seg_x(vec3f point, vec3f a, vec3f b)
+VECTORCALL VECMATH_FINLINE vec4f v_distance_to_seg_x(vec3f point, vec3f a, vec3f b)
 {
-  vec3f pt = closest_point_on_segment(point, a, b);
+  vec3f pt = v_closest_point_on_segment(point, a, b);
   return v_length3_x(v_sub(point, pt));
 }
 
@@ -3412,17 +3328,6 @@ VECTORCALL VECMATH_FINLINE vec4i v_permi_xyab(vec4i xyzw, vec4i abcd) { return v
 VECTORCALL VECMATH_FINLINE vec4i v_permi_xycd(vec4i xyzw, vec4i abcd) { return v_cast_vec4i(v_perm_xycd(v_cast_vec4f(xyzw), v_cast_vec4f(abcd))); }
 VECTORCALL VECMATH_FINLINE vec4i v_permi_xbzd(vec4i xyzw, vec4i abcd) { return v_cast_vec4i(v_perm_xayb(v_perm_xzxz(v_cast_vec4f(xyzw)), v_perm_ywyw(v_cast_vec4f(abcd)))); }
 VECTORCALL VECMATH_FINLINE vec4i v_permi_xyzd(vec4i xyzw, vec4i abcd) { return v_cast_vec4i(v_perm_xyzd(v_cast_vec4f(xyzw), v_cast_vec4f(abcd))); }
-VECTORCALL VECMATH_FINLINE vec4i v_permi_xzxz(vec4i xyzw) { return v_cast_vec4i(v_perm_xzxz(v_cast_vec4f(xyzw))); }
-VECTORCALL VECMATH_FINLINE vec4i v_permi_ywyw(vec4i xyzw) { return v_cast_vec4i(v_perm_ywyw(v_cast_vec4f(xyzw))); }
-VECTORCALL VECMATH_FINLINE vec4i v_permi_xyxy(vec4i xyzw) { return v_cast_vec4i(v_perm_xyxy(v_cast_vec4f(xyzw))); }
-VECTORCALL VECMATH_FINLINE vec4i v_permi_zwzw(vec4i xyzw) { return v_cast_vec4i(v_perm_zwzw(v_cast_vec4f(xyzw))); }
-VECTORCALL VECMATH_FINLINE vec4i v_permi_xxyy(vec4i xyzw) { return v_cast_vec4i(v_perm_xxyy(v_cast_vec4f(xyzw))); }
-VECTORCALL VECMATH_FINLINE vec4i v_permi_zzww(vec4i xyzw) { return v_cast_vec4i(v_perm_zzww(v_cast_vec4f(xyzw))); }
-VECTORCALL VECMATH_FINLINE vec4i v_permi_xxzz(vec4i xyzw) { return v_cast_vec4i(v_perm_xxzz(v_cast_vec4f(xyzw))); }
-VECTORCALL VECMATH_FINLINE vec4i v_permi_yyww(vec4i xyzw) { return v_cast_vec4i(v_perm_yyww(v_cast_vec4f(xyzw))); }
-VECTORCALL VECMATH_FINLINE vec4i v_permi_wwyy(vec4i xyzw) { return v_cast_vec4i(v_perm_wwyy(v_cast_vec4f(xyzw))); }
-VECTORCALL VECMATH_FINLINE vec4i v_permi_yzxw(vec4i xyzw) { return v_cast_vec4i(v_perm_yzxw(v_cast_vec4f(xyzw))); }
-VECTORCALL VECMATH_FINLINE vec4i v_permi_yzxy(vec4i xyzw) { return v_cast_vec4i(v_perm_yzxy(v_cast_vec4f(xyzw))); }
 
 VECTORCALL VECMATH_INLINE void v_get_bilinear_wrap_addr_pow2(vec4i &uv_idx, vec4f &uv_frac, vec4f uv_wrap, int size_bits, vec4f center_ofs)
 {
@@ -3432,11 +3337,7 @@ VECTORCALL VECMATH_INLINE void v_get_bilinear_wrap_addr_pow2(vec4i &uv_idx, vec4
 // don't use a pixel centered bilinear filtration because it creates shifts for different
   uv_wrap = v_mul(uv_wrap, dmap);
   uv_wrap = v_sub(uv_wrap, center_ofs);
-#if _TARGET_SIMD_SSE >= 4 || defined(__SSE4_1__)
-  vec4f floored = sse4_floor(uv_wrap);
-#else
   vec4f floored = v_floor(uv_wrap);
-#endif
   vec4i uvIdx = v_cvt_vec4i(floored);
   uv_frac = v_sub(uv_wrap, floored);
 
@@ -3453,17 +3354,15 @@ VECTORCALL VECMATH_INLINE void v_get_bilinear_wrap_addr(vec4i &uv_idx, vec4f &uv
   vec4f dmap = v_cvt_vec4f(dmapi);
 // don't use a pixel centered bilinear filtration because it creates shifts for different
   uv_wrap = v_sub(uv_wrap, v_div(center_ofs, dmap));
-#if _TARGET_SIMD_SSE >= 4 || defined(__SSE4_1__)
-  uv_wrap = v_mul(v_sub(uv_wrap, sse4_floor(uv_wrap)), dmap);
-#else
   uv_wrap = v_mul(v_sub(uv_wrap, v_floor(uv_wrap)), dmap);
-#endif
   vec4i uvIdx = v_cvt_vec4i(uv_wrap);
   uv_frac = v_sub(uv_wrap, v_cvt_vec4f(uvIdx));
 
-  uvIdx = v_seli(uvIdx, v_zeroi(), v_cmp_lti(uvIdx, dmapi)); // It is actually needed due to floating point imprecision
+  // v_seli returns the second operand where the mask is set: keep the in-range index,
+  // wrap idx == size (float imprecision) and the +1 texel to 0
+  uvIdx = v_seli(v_zeroi(), uvIdx, v_cmp_lti(uvIdx, dmapi));
   vec4i uvIdx1 = v_addi(uvIdx, V_CI_1);
-  vec4i uvNext = v_seli(uvIdx1, v_zeroi(), v_cmp_lti(uvIdx1, dmapi));
+  vec4i uvNext = v_seli(v_zeroi(), uvIdx1, v_cmp_lti(uvIdx1, dmapi));
   uvIdx = v_permi_xyab(uvIdx, uvNext);
 
   uv_idx = v_addi(v_permi_xzxz(uvIdx), v_permi_yyww(v_muli(uvIdx, dmapi)));
